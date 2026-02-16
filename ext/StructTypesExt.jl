@@ -3,7 +3,7 @@
 
 module StructTypesExt
 
-using DigitalIdentifiersBase: AbstractIdentifier
+using FastIdentifiers: AbstractIdentifier
 using StructTypes
 
 StructTypes.StructType(::Type{<:AbstractIdentifier}) = StructTypes.StringType()

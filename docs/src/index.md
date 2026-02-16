@@ -1,4 +1,4 @@
-# DigitalIdentifiersBase.jl
+# FastIdentifiers.jl
 
 A tiny framework for structured and validated identifier types.
 
@@ -16,18 +16,18 @@ ChecksumViolation
 Base.parse(::Type{<:AbstractIdentifier}, ::String)
 Base.tryparse(::Type{<:AbstractIdentifier}, ::String)
 Base.print(::IO, ::AbstractIdentifier)
-DigitalIdentifiersBase.idcode
-DigitalIdentifiersBase.idchecksum
-DigitalIdentifiersBase.shortcode
-DigitalIdentifiersBase.purl
-DigitalIdentifiersBase.purlprefix
+FastIdentifiers.idcode
+FastIdentifiers.idchecksum
+FastIdentifiers.shortcode
+FastIdentifiers.purl
+FastIdentifiers.purlprefix
 ```
 
 ## Helper functions
 
 ```@docs
-DigitalIdentifiersBase.@reexport
-DigitalIdentifiersBase.parseid
-DigitalIdentifiersBase.parsefor
-DigitalIdentifiersBase.lchopfolded
+FastIdentifiers.@reexport
+FastIdentifiers.parseid
+FastIdentifiers.parsefor
+FastIdentifiers.lchopfolded
 ```

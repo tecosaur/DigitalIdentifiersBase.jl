@@ -3,7 +3,7 @@
 
 module StructUtilsExt
 
-using DigitalIdentifiersBase: AbstractIdentifier
+using FastIdentifiers: AbstractIdentifier
 using StructUtils
 
 StructUtils.structlike(::Type{<:AbstractIdentifier}) = false

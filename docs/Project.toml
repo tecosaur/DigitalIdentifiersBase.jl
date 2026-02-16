@@ -1,6 +1,6 @@
 [deps]
-DigitalIdentifiersBase = "4753c187-0528-4cab-a788-b8a80107dae0"
+FastIdentifiers = "4753c187-0528-4cab-a788-b8a80107dae0"
 Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
 
 [sources]
-DigitalIdentifiersBase = {path = ".."}
+FastIdentifiers = {path = ".."}

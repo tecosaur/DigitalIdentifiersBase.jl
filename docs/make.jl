@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: MPL-2.0
 
 using Documenter
-using DigitalIdentifiersBase
+using FastIdentifiers
 
-Core.eval(DigitalIdentifiersBase,
+Core.eval(FastIdentifiers,
     quote
         """
             parse(::Type{T<:AbstractIdentifier}, representation::String) -> T
@@ -47,14 +47,14 @@ Core.eval(DigitalIdentifiersBase,
     end)
 
 makedocs(;
-    modules=[DigitalIdentifiersBase],
+    modules=[FastIdentifiers],
     pages=[
         "Index" => "index.md",
     ],
     format=Documenter.HTML(assets=["assets/favicon.ico"]),
-    sitename="DigitalIdentifiersBase.jl",
+    sitename="FastIdentifiers.jl",
     authors="tecosaur",
     warnonly=[:missing_docs],
 )
 
-deploydocs(repo="github.com/tecosaur/DigitalIdentifiersBase.jl")
+deploydocs(repo="github.com/tecosaur/FastIdentifiers.jl")

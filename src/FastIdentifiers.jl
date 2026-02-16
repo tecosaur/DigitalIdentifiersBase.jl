@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: © 2025 TEC <contact@tecosaur.net>
 # SPDX-License-Identifier: MPL-2.0
 
-module DigitalIdentifiersBase
+module FastIdentifiers
 
 export AbstractIdentifier, MalformedIdentifier, ChecksumViolation, shortcode, purl
 
@@ -10,11 +10,11 @@ export AbstractIdentifier, MalformedIdentifier, ChecksumViolation, shortcode, pu
 end
 
 """
-    DigitalIdentifiersBase.@reexport
+    FastIdentifiers.@reexport
 
 Convenience macro to import and export all public interface components.
 
-This macro generates `using` and `export` statements for the core `DigitalIdentifiersBase`
+This macro generates `using` and `export` statements for the core `FastIdentifiers`
 interface, making it easy to re-export the API from implementing packages.
 
 # Exported Components
@@ -27,7 +27,7 @@ interface, making it easy to re-export the API from implementing packages.
 """
 macro reexport()
     quote
-        using DigitalIdentifiersBase: AbstractIdentifier, MalformedIdentifier, ChecksumViolation, shortcode, purl
+        using FastIdentifiers: AbstractIdentifier, MalformedIdentifier, ChecksumViolation, shortcode, purl
         export AbstractIdentifier, MalformedIdentifier, ChecksumViolation, shortcode, purl
     end
 end

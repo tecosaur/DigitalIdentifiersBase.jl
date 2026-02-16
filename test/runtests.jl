@@ -3,7 +3,7 @@
 
 using Test
 
-using DigitalIdentifiersBase: DigitalIdentifiersBase, AbstractIdentifier, MalformedIdentifier,
+using FastIdentifiers: FastIdentifiers, AbstractIdentifier, MalformedIdentifier,
     ChecksumViolation, shortcode, purl, idcode, idchecksum, purlprefix,
     parseid, parsefor, lchopfolded
 
@@ -13,18 +13,18 @@ struct MyIdentifier <: AbstractIdentifier
     id::UInt16
 end
 
-DigitalIdentifiersBase.idcode(myid::MyIdentifier) = myid.id
-DigitalIdentifiersBase.idchecksum(myid::MyIdentifier) =
+FastIdentifiers.idcode(myid::MyIdentifier) = myid.id
+FastIdentifiers.idchecksum(myid::MyIdentifier) =
     sum(digits(myid.id) .* (2 .^ (1:ndigits(myid.id)) .- 1)) % 0xf
 
 @testset "Default shortcode" begin
     @test shortcode(MyIdentifier(1234)) == "1234"
 end
 
-DigitalIdentifiersBase.shortcode(myid::MyIdentifier) =
+FastIdentifiers.shortcode(myid::MyIdentifier) =
     string(myid.id) * string(idchecksum(myid), base=16)
 
-DigitalIdentifiersBase.purlprefix(::Type{MyIdentifier}) = "http://example.com/myid/"
+FastIdentifiers.purlprefix(::Type{MyIdentifier}) = "http://example.com/myid/"
 
 function MyIdentifier(id::Integer, checksum::Integer)
     id > typemax(UInt16) && throw(MalformedIdentifier{MyIdentifier}(id, "ID must be less than $(typemax(UInt16))"))
@@ -33,7 +33,7 @@ function MyIdentifier(id::Integer, checksum::Integer)
     myid
 end
 
-function DigitalIdentifiersBase.parseid(::Type{MyIdentifier}, id::SubString)
+function FastIdentifiers.parseid(::Type{MyIdentifier}, id::SubString)
     _, id = lchopfolded(id, "myid:", "http://example.com/myid/")
     str16..., checkchar = id
     i16 = parsefor(MyIdentifier, UInt16, str16)
@@ -75,8 +75,8 @@ struct OtherIdentifierID <: AbstractIdentifier
     id::UInt16
 end
 
-DigitalIdentifiersBase.idcode(otherid::OtherIdentifierID) = otherid.id
-DigitalIdentifiersBase.shortcode(otherid::OtherIdentifierID) =
+FastIdentifiers.idcode(otherid::OtherIdentifierID) = otherid.id
+FastIdentifiers.shortcode(otherid::OtherIdentifierID) =
     string("OtherIdentifierID:OtherIdentifier", idcode(otherid))
 
 # Test helpers for additional identifier types
@@ -84,13 +84,13 @@ struct MultiFieldIdentifier <: AbstractIdentifier
     id::UInt16
     version::UInt8
 end
-DigitalIdentifiersBase.idcode(x::MultiFieldIdentifier) = x.id
-DigitalIdentifiersBase.shortcode(x::MultiFieldIdentifier) = "$(x.id).$(x.version)"
+FastIdentifiers.idcode(x::MultiFieldIdentifier) = x.id
+FastIdentifiers.shortcode(x::MultiFieldIdentifier) = "$(x.id).$(x.version)"
 
 struct NestedIdentifier <: AbstractIdentifier
     inner::MyIdentifier
 end
-DigitalIdentifiersBase.idcode(ni::NestedIdentifier) = idcode(ni.inner)
+FastIdentifiers.idcode(ni::NestedIdentifier) = idcode(ni.inner)
 
 @testset "Output Formatting" begin
     @testset "Basic Output" begin
@@ -151,13 +151,13 @@ end
 struct ChecksumID <: AbstractIdentifier
     value::UInt16
 end
-DigitalIdentifiersBase.idchecksum(id::ChecksumID) = id.value % 10
+FastIdentifiers.idchecksum(id::ChecksumID) = id.value % 10
 
 struct NoConstructorID <: AbstractIdentifier
     a::String
     b::String
 end
-DigitalIdentifiersBase.idchecksum(::NoConstructorID) = 42
+FastIdentifiers.idchecksum(::NoConstructorID) = 42
 
 @testset "Generic Checksum Constructor" begin
     @test ChecksumID(123, 3).value == 123

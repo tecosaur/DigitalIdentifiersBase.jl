@@ -3,7 +3,7 @@
 
 module PrettyPrintExt
 
-using DigitalIdentifiersBase: AbstractIdentifier, MalformedIdentifier, ChecksumViolation, purl, shortcode, lchopfolded
+using FastIdentifiers: AbstractIdentifier, MalformedIdentifier, ChecksumViolation, purl, shortcode, lchopfolded
 
 using StyledStrings: @styled_str as @S_str
 
