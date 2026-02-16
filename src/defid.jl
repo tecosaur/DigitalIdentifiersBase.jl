@@ -44,6 +44,7 @@ julia> (id.id, id.version, id.participants)
 macro defid(name, pattern, args...)
     ctx = Base.ImmutableDict{Symbol, Any}(:name, name)
     ctx = Base.ImmutableDict{Symbol, Any}(ctx, :bits, Ref(0))
+    ctx = Base.ImmutableDict{Symbol, Any}(ctx, :segments, IdSegment[])
     ctx = Base.ImmutableDict{Symbol, Any}(ctx, :print_byte_estimate, Ref(0))
     ctx = Base.ImmutableDict{Symbol, Any}(ctx, :casefold, true)
     ctx = Base.ImmutableDict{Symbol, Any}(ctx, :__module__, __module__)
@@ -64,6 +65,8 @@ const IdExprs = @NamedTuple{parse::Vector{ExprVarLine},
                             print::Vector{ExprVarLine},
                             properties::Vector{Pair{Symbol, Vector{ExprVarLine}}}}
 
+const IdSegment = @NamedTuple{nbits::Int, kind::Symbol, label::Symbol, desc::String}
+
 const KNOWN_KEYS = (
     choice = (:casefold, :is),
     digits = (:base, :min, :max, :pad, :zfill),
@@ -72,6 +75,8 @@ const KNOWN_KEYS = (
 )
 
 const ALL_KNOWN_KEYS = Tuple(collect(Iterators.flatten(values(KNOWN_KEYS))))
+
+function segments end
 
 nbits(::Type{T}) where {T<:AbstractIdentifier} = 8 * sizeof(T)
 
@@ -229,7 +234,8 @@ function defid_skip!(exprs::IdExprs,
     end
     pval = get(ctx, :print, nothing)
     if !isnothing(pval)
-        push!(exprs.print, :(print(io, $pval)))
+        push!(ctx[:segments], (0, :skip, :skip, "Skipped literal string \"$(join(sargs, ", "))\""))
+        push!(exprs.print, :(print(io, $pval)), :(__segment_printed = $(length(ctx[:segments]))))
         ctx[:print_byte_estimate][] += ncodeunits(pval)
     end
     nothing
@@ -320,15 +326,20 @@ function defid_choice!(exprs::IdExprs,
               checkedmatch,
               defid_orshift(ctx, choiceint, fieldvar, nbits))
         fextract = :($fieldvar = $(defid_fextract(ctx, nbits, choicebits)))
+        push!(ctx[:segments], (choicebits, :choice, Symbol(chopprefix(String(fieldvar), "attr_")),
+                               join(soptions, " | ")))
         if isnothing(option)
             push!(exprs.print,
-                fextract,
-                :(print(io, @inbounds $(Tuple(soptions))[$fieldvar])))
+                  fextract,
+                  :(print(io, @inbounds $(Tuple(soptions))[$fieldvar])),
+                  :(__segment_printed = $(length(ctx[:segments]))))
         else
             push!(ctx[:oprint_detect],
                 fextract,
                 :($option = !iszero($fieldvar)))
-            push!(exprs.print, :(print(io, @inbounds $(Tuple(soptions))[$fieldvar])))
+            push!(exprs.print,
+                  :(print(io, @inbounds $(Tuple(soptions))[$fieldvar])),
+                  :(__segment_printed = $(length(ctx[:segments]))))
         end
         if haskey(ctx, :fieldvals)
             push!(ctx[:fieldvals],
@@ -347,7 +358,9 @@ function defid_choice!(exprs::IdExprs,
                   checkedmatch)
         end
         ctx[:print_byte_estimate][] += ncodeunits(target)
-        push!(exprs.print, :(print(io, $target)))
+        push!(ctx[:segments], (0, :choice, Symbol(chopprefix(String(fieldvar), "attr_")),
+                               "Choice of literal string \"$(target)\" vs $(join(soptions, ", "))"))
+        push!(exprs.print, :(print(io, $target)), :(__segment_printed = $(length(ctx[:segments]))))
     end
     nothing
 end
@@ -402,7 +415,8 @@ function defid_literal!(exprs::IdExprs,
                      end
                  end).args)
     end
-    push!(exprs.print, :(print(io, $lit)))
+    push!(ctx[:segments], (0, :literal, :literal, sprint(show, lit)))
+    push!(exprs.print, :(print(io, $lit)), :(__segment_printed = $(length(ctx[:segments]))))
     ctx[:print_byte_estimate][] += ncodeunits(lit)
     if haskey(ctx, :fieldvals)
         push!(ctx[:fieldvals],
@@ -488,10 +502,10 @@ function defid_digits!(exprs::IdExprs,
                     $option = true
                     $rangecheck
                     $numexpr
-               else
+                else
                     $option = false
                     zero($(cardtype(dbits)))
-               end)
+                end)
           end,
           defid_orshift(ctx, cardtype(dbits), fieldvar, nbits),
           :(id = unsafe_substr(id, $(if zfill digits else bitsconsumed end))))
@@ -513,11 +527,37 @@ function defid_digits!(exprs::IdExprs,
     else
         :(print(io, string($fieldvar, base=$base)))
     end
+    push!(ctx[:segments], (dbits, :digits, Symbol(chopprefix(String(fieldvar), "attr_")),
+                           string(if zfill
+                                      "up to $digits"
+                                  else
+                                      string(digits)
+                                  end,
+                                  if isone(digits)
+                                      " digit"
+                                  else
+                                      " digits"
+                                  end,
+                                  if base != 10
+                                      " in base $base"
+                                  else
+                                      ""
+                                  end,
+                                  if min > 0 && max < base^digits - 1
+                                      " between $(string(min; base, pad)) and $(string(max; base, pad))"
+                                  elseif min > 0
+                                      ", at least $(string(min; base, pad))"
+                                  elseif max < base^digits - 1
+                                      ", at most $(string(max; base, pad))"
+                                  else
+                                      ""
+                                  end)))
     if isnothing(option)
         push!(exprs.print,
               fextract,
               :($fieldvar = $fvalue),
-              printex)
+              printex,
+              :(__segment_printed = $(length(ctx[:segments]))))
     else
         push!(ctx[:oprint_detect],
               fextract,
@@ -526,6 +566,7 @@ function defid_digits!(exprs::IdExprs,
               :(if $option
                     $fieldvar = $fvalue
                     $printex
+                    __segment_printed = $(length(ctx[:segments]))
                 end))
     end
     if haskey(ctx, :fieldvals)
@@ -579,14 +620,18 @@ end
 
 function implement_casting!(expr::Expr, name::Symbol, finalsize::Int)
     if Meta.isexpr(expr, :call, 3) && first(expr.args) ∈ (:__cast_to_id, :__cast_from_id)
-        casttype, targettype, value = expr.args
-        typesize = sizeof(targettype)
-        expr.args[1:3] = if typesize == finalsize
-            :(Core.bitcast($targettype, $value)).args
-        elseif typesize < finalsize ⊻ (casttype == :__cast_to_id)
-            :(Core.Intrinsics.zext_int($(esc(name)), $value)).args
+        casttype, valtype, value = expr.args
+        targettype, targetsize, valsize = if casttype == :__cast_to_id
+            esc(name), finalsize, sizeof(valtype)
         else
-            :(Core.Intrinsics.trunc_int($(esc(name)), $value)).args
+            valtype, sizeof(valtype), finalsize
+        end
+        expr.args[1:3] = if valsize == targetsize
+            :(Core.bitcast($targettype, $value)).args
+        elseif valsize < targetsize
+            :(Core.Intrinsics.zext_int($targettype, $value)).args
+        else
+            :(Core.Intrinsics.trunc_int($targettype, $value)).args
         end
     else
         for arg in expr.args
@@ -619,8 +664,22 @@ function defid_parser(pexprs::Vector{ExprVarLine}, ctx::Base.ImmutableDict{Symbo
 end
 
 function defid_shortcode(pexprs::Vector{ExprVarLine}, ctx::Base.ImmutableDict{Symbol, Any}, name::Symbol)
+    function strip_segsets!(expr::ExprVarLine)
+        expr isa Expr || return expr
+        delat = Int[]
+        for (i, arg) in enumerate(expr.args)
+            arg isa Expr || continue
+            if Meta.isexpr(arg, :(=), 2) && first(arg.args) === :__segment_printed
+                push!(delat, i)
+            else
+                strip_segsets!(arg)
+            end
+        end
+        isempty(delat) || deleteat!(expr.args, delat)
+        expr
+    end
     :(function $(GlobalRef(@__MODULE__, :shortcode))(io::IO, id::$(esc(name)))
-          $(implement_casting!(ctx, pexprs)...)
+          $(implement_casting!(ctx, map(strip_segsets! ∘ copy, pexprs))...)
           nothing
       end)
 end
@@ -646,6 +705,49 @@ function defid_properties(pexprs::Vector{Pair{Symbol, Vector{ExprVarLine}}}, ctx
       end)
 end
 
+function defid_segments_type(ctx::Base.ImmutableDict{Symbol, Any}, name::Symbol)
+    segments = ctx[:segments]
+    isempty(segments) && return :()
+    :(function $(GlobalRef(@__MODULE__, :segments))(::Type{$(esc(name))})
+          $(Expr(:tuple, [(; nbits, kind, label, desc) for (; nbits, kind, label, desc) in segments if nbits > 0]...))
+      end)
+end
+
+function defid_segments_value(ctx::Base.ImmutableDict{Symbol, Any}, pexprs::Vector{ExprVarLine}, name::Symbol)
+    function print_segsets!(segvars::Vector{Tuple{Int, Symbol}}, expr::ExprVarLine)
+        expr isa Expr || return expr
+        if Meta.isexpr(expr, :(=)) && first(expr.args) === :__segment_printed
+            _, i = expr.args
+            # We should never see i+1 before i
+            if i > length(segvars)
+                anon = ctx[:segments][i].nbits == 0
+                precount = sum((s.nbits > 0 for s in ctx[:segments][1:i-1]), init = 0)
+                push!(segvars, (ifelse(anon, 0, precount + 1), Symbol("seg$i")))
+            end
+            var = last(segvars[i])
+            expr.args[1:2] = :($var = takestring!(io)).args
+        else
+            for arg in expr.args
+                arg isa Expr && print_segsets!(segvars, arg)
+            end
+        end
+        expr
+    end
+    segments = ctx[:segments]
+    isempty(segments) && return :()
+    svars = Tuple{Int, Symbol}[]
+    pexprs2 = map(copy, pexprs)
+    for expr in pexprs2
+        print_segsets!(svars, expr)
+    end
+    :(function $(GlobalRef(@__MODULE__, :segments))(id::$(esc(name)))
+          io = IOBuffer()
+          $((:($s = "") for (_, s) in svars)...)
+          $(pexprs2...)
+          $(Expr(:tuple, (Expr(:tuple, i, s) for (i, s) in svars)...))
+      end)
+end
+
 function defid_make(exprs::IdExprs, ctx::Base.ImmutableDict{Symbol, Any}, name::Symbol)
     block = Expr(:block) # :toplevel
     numbits = 8 * cld(ctx[:bits][], 8)
@@ -656,6 +758,8 @@ function defid_make(exprs::IdExprs, ctx::Base.ImmutableDict{Symbol, Any}, name::
           defid_shortcode(exprs.print, ctx, name),
           :($(GlobalRef(Base, :propertynames))(::$(esc(name))) = $(Tuple(map(first, exprs.properties)))),
           defid_properties(exprs.properties, ctx, name),
+          defid_segments_type(ctx, name),
+          defid_segments_value(ctx, exprs.print, name),
           esc(name))
     block
 end
