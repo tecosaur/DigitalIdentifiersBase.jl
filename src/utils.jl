@@ -59,6 +59,111 @@ function byte2int(b::UInt8, base::Integer)
 end
 
 """
+    parsechars(::Type{P}, str::AbstractString, maxlen::Int, ranges::NTuple{N, UnitRange{UInt8}}, casefold::Bool) -> (Int, P)
+
+Parse up to `maxlen` characters from `str`, mapping each byte to a 0-based
+index via the given byte `ranges`. Each range maps contiguously: the first
+range covers indices 0:length(r1)-1, the second continues from there, etc.
+The total number of distinct values determines bits per character, packed MSB-first
+into an unsigned integer of type `P`.
+
+When `casefold` is true, both the input byte and range endpoints are
+lowercased (`| 0x20`) before comparison, enabling case-insensitive matching.
+
+Returns `(chars_consumed, packed_value)`. Stops at the first non-matching byte.
+"""
+function parsechars(::Type{P}, bytes::AbstractVector{UInt8}, pos::Int, maxlen::Int,
+                    ranges::NTuple{N, UnitRange{UInt8}},
+                    casefold::Bool) where {P <: Unsigned, N}
+    nvals = sum(length, ranges)
+    bpc = cardbits(nvals)
+    packed = zero(P)
+    endpos = min(pos + maxlen, length(bytes) + 1)
+    pos > length(bytes) && return 0, packed
+    nread = 0
+    @inbounds while pos < endpos
+        b = bytes[pos]
+        casefold && (b |= 0x20)
+        idx = 0xff % UInt8
+        offset = zero(UInt8)
+        for r in ranges
+            lo = casefold ? (first(r) | 0x20) : first(r)
+            d = b - lo
+            if d < length(r) % UInt8
+                idx = offset + d
+                break
+            end
+            offset += length(r) % UInt8
+        end
+        idx == 0xff && break
+        packed = (packed << bpc) | P(idx)
+        nread += 1
+        pos += 1
+    end
+    nread, packed
+end
+
+function parsechars(::Type{P}, str::AbstractString, maxlen::Int,
+                    ranges::NTuple{N, UnitRange{UInt8}},
+                    casefold::Bool) where {P <: Unsigned, N}
+    parsechars(P, codeunits(str), 1, maxlen, ranges, casefold)
+end
+
+"""
+    printchars(io::IO, packed::Unsigned, nchars::Int, ranges::NTuple{N, UnitRange{UInt8}})
+
+Unpack `nchars` characters from `packed` (MSB-first, same encoding as
+[`parsechars`](@ref)) and write them to `io` using the given byte `ranges`.
+"""
+function printchars(io::IO, packed::P, nchars::Int,
+                    ranges::NTuple{N, UnitRange{UInt8}}) where {P <: Unsigned, N}
+    nvals = sum(length, ranges)
+    bpc = cardbits(nvals)
+    topshift = 8 * sizeof(P) - bpc
+    packed <<= 8 * sizeof(P) - nchars * bpc
+    @inbounds for _ in 1:nchars
+        idx = UInt8(packed >> topshift)
+        for r in ranges
+            rlen = length(r) % UInt8
+            if idx < rlen
+                write(io, first(r) + idx)
+                break
+            end
+            idx -= rlen
+        end
+        packed <<= bpc
+    end
+end
+
+"""
+    chars2string(packed::Unsigned, nchars::Int, ranges::NTuple{N, UnitRange{UInt8}}) -> String
+
+Unpack `nchars` characters from `packed` into a `String`, using the same
+encoding as [`parsechars`](@ref).
+"""
+function chars2string(packed::P, nchars::Int,
+                      ranges::NTuple{N, UnitRange{UInt8}}) where {P <: Unsigned, N}
+    nvals = sum(length, ranges)
+    bpc = cardbits(nvals)
+    topshift = 8 * sizeof(P) - bpc
+    packed <<= 8 * sizeof(P) - nchars * bpc
+    buf = Vector{UInt8}(undef, nchars)
+    @inbounds for ci in 1:nchars
+        idx = UInt8(packed >> topshift)
+        for r in ranges
+            rlen = length(r) % UInt8
+            if idx < rlen
+                buf[ci] = first(r) + idx
+                break
+            end
+            idx -= rlen
+        end
+        packed <<= bpc
+    end
+    String(buf)
+end
+
+"""
     fastparse(::Type{I<:Integer}, number::Union{Char, <:AbstractString}, base::Integer) -> Union{I, Nothing}
 
 Attempt to parse the `number` as an integer of type `I` in the specified `base`.
@@ -79,22 +184,28 @@ function fastparse(::Type{I}, str::AbstractString, base::Integer) where {I <: Un
     num
 end
 
-function parseint(::Type{I}, str::AbstractString, base::Integer, maxlen::Integer) where {I <: Unsigned}
+function parseint(::Type{I}, bytes::AbstractVector{UInt8}, pos::Int, base::Integer, maxlen::Integer) where {I <: Unsigned}
     num = zero(I)
-    i, bytes = 1, codeunits(str)
-    isempty(bytes) && return 0, zero(I)
+    nread = 0
+    endpos = min(pos + maxlen, length(bytes) + 1)
+    pos > length(bytes) && return 0, zero(I)
     # NOTE: Don't ask me why, but it turns out that `while` is
     # considerably faster than `for` here (~7ns vs ~4ns).
-    @inbounds while true 
-        digit = byte2int(bytes[i], base)
-        digit == 0xff && return i - 1, num # Invalid byte
+    @inbounds while true
+        digit = byte2int(bytes[pos], base)
+        digit == 0xff && return nread, num # Invalid byte
         numnext = muladd(widen(num), base % I, digit)
         iszero(numnext & ~widen(typemax(I))) || return 0, zero(I) # Overflow check
         num = numnext % I
-        i < maxlen || break
-        i += 1
+        nread += 1
+        pos += 1
+        pos < endpos || break
     end
-    i, num
+    nread, num
+end
+
+function parseint(::Type{I}, str::AbstractString, base::Integer, maxlen::Integer) where {I <: Unsigned}
+    parseint(I, codeunits(str), 1, base, maxlen)
 end
 
 """

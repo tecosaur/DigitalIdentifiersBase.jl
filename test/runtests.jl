@@ -178,3 +178,5 @@ end
     @test JSON.parse(JSON.json(myid), MyIdentifier) == myid
     @test JSON3.read(JSON3.write(myid), MyIdentifier) == myid
 end
+
+include("defid.jl")
