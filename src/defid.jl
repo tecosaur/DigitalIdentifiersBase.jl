@@ -52,6 +52,7 @@ macro defid(name, pattern, args...)
     ctx = Base.ImmutableDict{Symbol, Any}(ctx, :parsed_bytes_min, Ref(0))
     ctx = Base.ImmutableDict{Symbol, Any}(ctx, :parsed_bytes_max, Ref(0))
     ctx = Base.ImmutableDict{Symbol, Any}(ctx, :casefold, true)
+    ctx = Base.ImmutableDict{Symbol, Any}(ctx, :errconsts, String[])
     ctx = Base.ImmutableDict{Symbol, Any}(ctx, :__module__, __module__)
     for arg in args
         Meta.isexpr(arg, :(=), 2) || throw(ArgumentError("Expected keyword arguments of the form key=value, got $arg"))
@@ -113,6 +114,13 @@ Base.@assume_effects :foldable function cardtype(minbits::Int)
     logtypesize = 1 + 8 * sizeof(minbits) - leading_zeros(cld(minbits, 8) - 1)
     logtypesize > 5 && throw(ArgumentError("Cannot allocate more than 128 bits for an identifier field, but $minbits bits were requested"))
     (UInt8, UInt16, UInt32, UInt64, UInt128)[logtypesize]
+end
+
+"""Register a compile-time error message and return its 1-based index for use as an error code."""
+function defid_errmsg(ctx::Base.ImmutableDict{Symbol, Any}, msg::String)
+    errmsgs = ctx[:errconsts]
+    push!(errmsgs, msg)
+    length(errmsgs)
 end
 
 function defid_dispatch!(exprs::IdExprs,
@@ -645,7 +653,8 @@ function defid_choice!(exprs::IdExprs,
           end)]
     end
     notfound = if isnothing(option)
-        :(return ($"Expected one of $(join(soptions, ", "))", pos))
+        errsym = defid_errmsg(ctx, "Expected one of $(join(soptions, ", "))")
+        :(return ($errsym, pos))
     else
         :($option = false)
     end
@@ -850,7 +859,8 @@ function defid_literal!(exprs::IdExprs,
                         lit::String)
     option = get(ctx, :optional, nothing)
     notfound = if isnothing(option)
-        :(return ($"Expected literal '$(lit)'", pos))
+        errsym = defid_errmsg(ctx, "Expected literal '$(lit)'")
+        :(return ($errsym, pos))
     else
         :($option = false)
     end
@@ -972,19 +982,21 @@ function defid_digits!(exprs::IdExprs,
     rangecheck = if min == 0 && max == base^maxdigits - 1
         :()
     else
-        maxcheck = :($fnum <= $max || return ($"Expected at most a value of $(string(max; base, pad))", pos))
-        mincheck = :($fnum >= $min || return ($"Expected at least a value of $(string(min; base, pad))", pos))
+        maxerr = defid_errmsg(ctx, "Expected at most a value of $(string(max; base, pad))")
+        minerr = defid_errmsg(ctx, "Expected at least a value of $(string(min; base, pad))")
+        maxcheck = :($fnum <= $max || return ($maxerr, pos))
+        mincheck = :($fnum >= $min || return ($minerr, pos))
         if min == 0; maxcheck
         elseif max == base^maxdigits - 1; mincheck
         else :($mincheck; $maxcheck) end
     end
-    errmsg = if fixedwidth && maxdigits > 1
+    errmsg = defid_errmsg(ctx, if fixedwidth && maxdigits > 1
         "exactly $maxdigits digits in base $base"
     elseif mindigits > 1
         "$mindigits to $maxdigits digits in base $base"
     else
         "up to $maxdigits digits in base $base"
-    end
+    end)
     directvar = numexpr === fnum
     parsevar = ifelse(directvar, fnum, fieldvar)
     push!(exprs.parse,
@@ -1134,11 +1146,11 @@ function defid_charseq!(exprs::IdExprs,
     # --- Parse ---
     push!(exprs.parse,
           :(($lenvar, $charvar) = parsechars($cT, idbytes, pos, $scanlimit, $ranges, $cfold, $oneindexed)))
-    errmsg = if variable
+    errmsg = defid_errmsg(ctx, if variable
         "Expected $minlen to $maxlen $kind characters"
     else
         "Expected $maxlen $kind characters"
-    end
+    end)
     notfound = if isnothing(option)
         [:(return ($errmsg, pos))]
     else
@@ -1415,7 +1427,7 @@ function defid_parsebytes(pexprs::Vector{ExprVarLine}, ctx::Base.ImmutableDict{S
     parsed_min = ctx[:parsed_bytes_min][]
     resolved, elided = resolve_length_checks!(implement_casting!(ctx, pexprs), parsed_min)
     # Split at __upfront_lengthcheck sentinel, replacing it with the actual check
-    errmsg = string("Expected at least ", parsed_min, " bytes")
+    errmsg = defid_errmsg(ctx, string("Expected at least ", parsed_min, " bytes"))
     split_idx = findfirst(e -> Meta.isexpr(e, :call) && first(e.args) === :__upfront_lengthcheck, resolved)
     if !isnothing(split_idx) && elided
         check = if split_idx > 1
@@ -1444,15 +1456,24 @@ function defid_parsebytes(pexprs::Vector{ExprVarLine}, ctx::Base.ImmutableDict{S
       end)
 end
 
-function defid_parseid(ctx::Base.ImmutableDict{Symbol, Any}, name::Symbol)
-    :(function $(GlobalRef(@__MODULE__, :parseid))(::Type{$(esc(name))}, id::SubString)
-          result, pos = parsebytes($(esc(name)), codeunits(id))
-          if result isa $(esc(name))
-              pos > ncodeunits(id) || return MalformedIdentifier{$(esc(name))}(id, "Unparsed trailing content")
-              return result
-          end
-          MalformedIdentifier{$(esc(name))}(id, result)
-      end)
+function defid_parse(ctx::Base.ImmutableDict{Symbol, Any}, name::Symbol)
+    errmsgs = Tuple(ctx[:errconsts])
+    ename = esc(name)
+    (:(function $(GlobalRef(Base, :parse))(::Type{$ename}, id::AbstractString)
+           result, pos = parsebytes($ename, codeunits(id))
+           if result isa $ename
+               pos > ncodeunits(id) || throw(MalformedIdentifier{$ename}(id, "Unparsed trailing content"))
+               result
+           else
+               throw(MalformedIdentifier{$ename}(id, @inbounds $errmsgs[result]))
+           end
+       end),
+     :(function $(GlobalRef(Base, :tryparse))(::Type{$ename}, id::AbstractString)
+           result, pos = parsebytes($ename, codeunits(id))
+           if result isa $ename && pos > ncodeunits(id)
+               result
+           end
+       end))
 end
 
 function defid_bufprint!(pexprs::Union{Vector{<:ExprVarLine}, Vector{Any}})
@@ -1692,7 +1713,7 @@ function defid_make(exprs::IdExprs, ctx::Base.ImmutableDict{Symbol, Any}, name::
           :(Base.@__doc__(primitive type $(esc(name)) <: $AbstractIdentifier $numbits end)),
           :($(GlobalRef(@__MODULE__, :nbits))(::Type{$(esc(name))}) = $(ctx[:bits][])),
           defid_parsebytes(exprs.parse, ctx, name),
-          defid_parseid(ctx, name),
+          defid_parse(ctx, name)...,
           defid_shortcode(exprs.print, ctx, name),
           :($(GlobalRef(Base, :propertynames))(::$(esc(name))) = $(Tuple(map(first, exprs.properties)))),
           defid_properties(exprs.properties, ctx, name),
