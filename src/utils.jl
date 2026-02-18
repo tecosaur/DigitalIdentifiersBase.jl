@@ -74,26 +74,27 @@ Returns `(chars_consumed, packed_value)`. Stops at the first non-matching byte.
 """
 function parsechars(::Type{P}, bytes::AbstractVector{UInt8}, pos::Int, maxlen::Int,
                     ranges::NTuple{N, UnitRange{UInt8}},
-                    casefold::Bool) where {P <: Unsigned, N}
+                    casefold::Bool, oneindexed::Bool = false) where {P <: Unsigned, N}
     nvals = sum(length, ranges)
-    bpc = cardbits(nvals)
+    bpc = cardbits(nvals + oneindexed)
     packed = zero(P)
     endpos = min(pos + maxlen, length(bytes) + 1)
     pos > length(bytes) && return 0, packed
+    offset = UInt8(oneindexed)
     nread = 0
     @inbounds while pos < endpos
         b = bytes[pos]
         casefold && (b |= 0x20)
         idx = 0xff % UInt8
-        offset = zero(UInt8)
+        base = offset
         for r in ranges
             lo = casefold ? (first(r) | 0x20) : first(r)
             d = b - lo
             if d < length(r) % UInt8
-                idx = offset + d
+                idx = base + d
                 break
             end
-            offset += length(r) % UInt8
+            base += length(r) % UInt8
         end
         idx == 0xff && break
         packed = (packed << bpc) | P(idx)
@@ -105,24 +106,26 @@ end
 
 function parsechars(::Type{P}, str::AbstractString, maxlen::Int,
                     ranges::NTuple{N, UnitRange{UInt8}},
-                    casefold::Bool) where {P <: Unsigned, N}
-    parsechars(P, codeunits(str), 1, maxlen, ranges, casefold)
+                    casefold::Bool, oneindexed::Bool = false) where {P <: Unsigned, N}
+    parsechars(P, codeunits(str), 1, maxlen, ranges, casefold, oneindexed)
 end
 
 """
-    printchars(io::IO, packed::Unsigned, nchars::Int, ranges::NTuple{N, UnitRange{UInt8}})
+    printchars(io::IO, packed::Unsigned, nchars::Int, ranges::NTuple{N, UnitRange{UInt8}}, oneindexed::Bool=false)
 
 Unpack `nchars` characters from `packed` (MSB-first, same encoding as
 [`parsechars`](@ref)) and write them to `io` using the given byte `ranges`.
 """
 function printchars(io::IO, packed::P, nchars::Int,
-                    ranges::NTuple{N, UnitRange{UInt8}}) where {P <: Unsigned, N}
+                    ranges::NTuple{N, UnitRange{UInt8}},
+                    oneindexed::Bool = false) where {P <: Unsigned, N}
     nvals = sum(length, ranges)
-    bpc = cardbits(nvals)
+    bpc = cardbits(nvals + oneindexed)
     topshift = 8 * sizeof(P) - bpc
     packed <<= 8 * sizeof(P) - nchars * bpc
+    offset = UInt8(oneindexed)
     @inbounds for _ in 1:nchars
-        idx = UInt8(packed >> topshift)
+        idx = UInt8(packed >> topshift) - offset
         for r in ranges
             rlen = length(r) % UInt8
             if idx < rlen
@@ -136,20 +139,22 @@ function printchars(io::IO, packed::P, nchars::Int,
 end
 
 """
-    chars2string(packed::Unsigned, nchars::Int, ranges::NTuple{N, UnitRange{UInt8}}) -> String
+    chars2string(packed::Unsigned, nchars::Int, ranges::NTuple{N, UnitRange{UInt8}}, oneindexed::Bool=false) -> String
 
 Unpack `nchars` characters from `packed` into a `String`, using the same
 encoding as [`parsechars`](@ref).
 """
 function chars2string(packed::P, nchars::Int,
-                      ranges::NTuple{N, UnitRange{UInt8}}) where {P <: Unsigned, N}
+                      ranges::NTuple{N, UnitRange{UInt8}},
+                      oneindexed::Bool = false) where {P <: Unsigned, N}
     nvals = sum(length, ranges)
-    bpc = cardbits(nvals)
+    bpc = cardbits(nvals + oneindexed)
     topshift = 8 * sizeof(P) - bpc
     packed <<= 8 * sizeof(P) - nchars * bpc
     buf = Vector{UInt8}(undef, nchars)
+    offset = UInt8(oneindexed)
     @inbounds for ci in 1:nchars
-        idx = UInt8(packed >> topshift)
+        idx = UInt8(packed >> topshift) - offset
         for r in ranges
             rlen = length(r) % UInt8
             if idx < rlen

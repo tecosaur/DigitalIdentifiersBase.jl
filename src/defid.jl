@@ -49,6 +49,8 @@ macro defid(name, pattern, args...)
     ctx = Base.ImmutableDict{Symbol, Any}(ctx, :segments, IdSegment[])
     ctx = Base.ImmutableDict{Symbol, Any}(ctx, :print_bytes_min, Ref(0))
     ctx = Base.ImmutableDict{Symbol, Any}(ctx, :print_bytes_max, Ref(0))
+    ctx = Base.ImmutableDict{Symbol, Any}(ctx, :parsed_bytes_min, Ref(0))
+    ctx = Base.ImmutableDict{Symbol, Any}(ctx, :parsed_bytes_max, Ref(0))
     ctx = Base.ImmutableDict{Symbol, Any}(ctx, :casefold, true)
     ctx = Base.ImmutableDict{Symbol, Any}(ctx, :__module__, __module__)
     for arg in args
@@ -59,12 +61,22 @@ macro defid(name, pattern, args...)
         ctx = Base.ImmutableDict{Symbol, Any}(ctx, kwname, kwval)
     end
     exprs = IdExprs(([], [], []))
+    # Strip leading prefixes (stripname/purlprefix) before the main pattern
+    prefix = get(ctx, :purlprefix, nothing)
+    stripname = get(ctx, :stripname, true)::Bool
+    skipprefixes = String[]
+    !isnothing(prefix) && push!(skipprefixes, lowercase(prefix))
+    stripname && push!(skipprefixes, lowercase(string(name)) * ":")
+    if !isempty(skipprefixes)
+        defid_dispatch!(exprs, ctx, Expr(:call, :skip, skipprefixes...))
+    end
+    defid_dispatch!(exprs, ctx, :__first_nonskip)
     defid_dispatch!(exprs, ctx, pattern)
     defid_make(exprs, ctx, name)
 end
 
 @static if VERSION < v"1.13-"
-    takestring(io::IO) = String(take!(io))
+    takestring!(io::IO) = String(take!(io))
 end
 
 const ExprVarLine = Union{Expr, Symbol, LineNumberNode}
@@ -83,7 +95,7 @@ const KNOWN_KEYS = (
     _global = (:purlprefix, :stripname)
 )
 
-const ALL_KNOWN_KEYS = Tuple(collect(Iterators.flatten(values(KNOWN_KEYS))))
+const ALL_KNOWN_KEYS = Tuple(unique(collect(Iterators.flatten(values(KNOWN_KEYS)))))
 
 function segments end
 
@@ -171,6 +183,10 @@ function defid_dispatch!(exprs::IdExprs,
         defid_dispatch!(exprs, ctx, name, args)
     elseif thing isa String
         defid_literal!(exprs, ctx, thing)
+    elseif thing === :__first_nonskip
+        ctx[:parsed_bytes_min][] = 0
+        ctx[:parsed_bytes_max][] = 0
+        push!(exprs.parse, Expr(:call, :__upfront_lengthcheck))
     end
 end
 
@@ -179,7 +195,7 @@ function defid_field!(exprs::IdExprs,
                       node::QuoteNode,
                       args::Vector{Any})
     isnothing(get(ctx, :fieldvar, nothing)) || throw(ArgumentError("Fields may not be nested"))
-    fieldvals = Expr[]
+    fieldvals = Any[]
     ctx = Base.ImmutableDict{Symbol, Any}(ctx, :fieldvar, Symbol("attr_$(node.value)"))
     ctx = Base.ImmutableDict{Symbol, Any}(ctx, :fieldvals, fieldvals)
     initialprints = length(exprs.print)
@@ -189,13 +205,16 @@ function defid_field!(exprs::IdExprs,
     if length(fieldvals) == 0
         throw(ArgumentError("Field $(node.value) does not capture any value"))
     elseif length(fieldvals) == 1
-        push!(exprs.properties, node.value => fieldvals[1].args)
+        fv = first(fieldvals)
+        push!(exprs.properties, node.value => if fv isa Expr; fv.args else [fv] end)
     else
+        propprints = map(strip_segsets! ∘ copy, exprs.print[initialprints+1:end])
+        filter!(e -> !Meta.isexpr(e, :(=), 2) || first(e.args) !== :__segment_printed, propprints)
         push!(exprs.properties, node.value => (
             quote
                 io = IOBuffer()
-                $(exprs.print[initialprints+1:end]...)
-                :(takestring!(io))
+                $(propprints...)
+                takestring!(io)
             end).args)
     end
 end
@@ -207,7 +226,8 @@ function defid_optional!(exprs::IdExprs,
     ctx = Base.ImmutableDict{Symbol, Any}(ctx, :optional, gensym("optional"))
     ctx = Base.ImmutableDict{Symbol, Any}(ctx, :oprint_detect, ExprVarLine[])
     oexprs = (; parse = ExprVarLine[], print = ExprVarLine[], properties = exprs.properties)
-    saved_min = ctx[:print_bytes_min][]
+    saved_print_min = ctx[:print_bytes_min][]
+    saved_parse_min = ctx[:parsed_bytes_min][]
     if all(a -> a isa String, args)
         defid_choice!(oexprs, ctx, push!(Any[join(Vector{String}(args))], ""))
     else
@@ -215,7 +235,8 @@ function defid_optional!(exprs::IdExprs,
             defid_dispatch!(oexprs, ctx, arg)
         end
     end
-    ctx[:print_bytes_min][] = saved_min
+    ctx[:print_bytes_min][] = saved_print_min
+    ctx[:parsed_bytes_min][] = saved_parse_min
     if isnothing(popt)
         append!(exprs.parse, oexprs.parse)
     else
@@ -241,6 +262,7 @@ function defid_skip!(exprs::IdExprs,
         all(isascii, sargs) || throw(ArgumentError("Expected all arguments to be ASCII strings for skip with casefolding"))
     end
     push!(exprs.parse, gen_static_lchop(casefold ? map(lowercase, sargs) : sargs, casefold=casefold))
+    ctx[:parsed_bytes_max][] += maximum(ncodeunits, sargs)
     if !isnothing(pval)
         push!(ctx[:segments], (0, :skip, :skip, "Skipped literal string \"$(join(sargs, ", "))\""))
         push!(exprs.print, :(print(io, $pval)), :(__segment_printed = $(length(ctx[:segments]))))
@@ -259,8 +281,9 @@ and multiple hash families. Returns `nothing` or a named tuple with:
 - `iT`: unsigned integer type for the window load
 - `foldmask`: OR mask for case folding
 - `hashexpr`: function `value_expr -> index_expr` producing a 1-based index
-- `order`: permutation of options matching hash output order
-- `kind`: `:direct` (no table), `:offset` (subtract constant), or `:table`
+- `perm`: permutation of options matching hash output order
+- `kind`: `:direct` (consecutive hash values) or `:table` (lookup table)
+- `injective`: whether the hash function is injective (identity family)
 - `table`: lookup table (only for `:table` kind)
 - `tablelen`: length of table (only for `:table` kind)
 """
@@ -304,7 +327,7 @@ function find_perfect_hash(options::Vector{String}, casefold::Bool)
             result = classify_hash(hvals, nopts, options,
                                     pos, iT, foldmask % iT, hashfam.expr)
             if result.tier < best_tier
-                best = result.ph
+                best = merge(result.ph, (; injective = hashfam.injective))
                 best_tier = result.tier
                 best_tier <= 1 && break
             end
@@ -314,23 +337,23 @@ function find_perfect_hash(options::Vector{String}, casefold::Bool)
 end
 
 function hash_families(iT::DataType, nopts::Int)
-    families = @NamedTuple{fn::Function, expr::Function}[]
+    families = @NamedTuple{fn::Function, expr::Function, injective::Bool}[]
     # v (identity — simplest possible hash, produces v - offset when consecutive)
-    push!(families, (fn = v -> v, expr = v -> v))
+    push!(families, (fn = v -> v, expr = v -> v, injective = true))
     for m in nopts:2*nopts
         # v % m + 1
         push!(families, (fn = v -> v % m + 1,
-                         expr = v -> :($v % $m + 1)))
+                         expr = v -> :($v % $m + 1), injective = false))
         # (v >> k) % m + 1
         for k in 1:min(8 * sizeof(iT) - 1, 16)
             push!(families, (fn = v -> (v >> k) % m + 1,
-                             expr = v -> :(($v >> $k) % $m + 1)))
+                             expr = v -> :(($v >> $k) % $m + 1), injective = false))
         end
         # (v * c) >> k % m + 1
         for c in (0x9e3779b97f4a7c15, 0x517cc1b727220a95, 0x6c62272e07bb0142)
             for k in max(1, 8 * sizeof(iT) - 8):8 * sizeof(iT) - 1
                 push!(families, (fn = v -> (v * c) >> k % m + 1,
-                                 expr = v -> :((($v * $(c % iT)) >> $k) % $m + 1)))
+                                 expr = v -> :((($v * $(c % iT)) >> $k) % $m + 1), injective = false))
             end
         end
     end
@@ -341,12 +364,10 @@ function classify_hash(hvals::Vector{UInt64}, nopts::Int, options::Vector{String
                         pos::Int, iT::DataType, foldmask, hashexpr_fn)
     sorted_indices = sortperm(hvals)
     sorted_hvals = hvals[sorted_indices]
-    order = options[sorted_indices]
     lo, hi = Int(sorted_hvals[1]), Int(sorted_hvals[end])
     # Tier 1: consecutive values — hashexpr(v) ± offset maps to 1:n
     if hi - lo + 1 == nopts
         if lo == 1
-            # Already 1:n, no offset needed
             ph = (; pos, iT, foldmask, hashexpr = hashexpr_fn,
                    perm = sorted_indices, kind = :direct,
                    table = (), tablelen = 0)
@@ -357,17 +378,6 @@ function classify_hash(hvals::Vector{UInt64}, nopts::Int, options::Vector{String
                    perm = sorted_indices, kind = :direct,
                    table = (), tablelen = 0)
         end
-        return (; tier = 1, ph)
-    end
-    # Tier 1b: consecutive descending
-    rsorted_indices = sortperm(hvals, rev=true)
-    rsorted_hvals = hvals[rsorted_indices]
-    if Int(rsorted_hvals[1]) - Int(rsorted_hvals[end]) + 1 == nopts
-        top = iT(rsorted_hvals[1] + 1)
-        ph = (; pos, iT, foldmask,
-               hashexpr = v -> :($top - $(hashexpr_fn(v))),
-               perm = rsorted_indices, kind = :direct,
-               table = (), tablelen = 0)
         return (; tier = 1, ph)
     end
     # Tier 3: table lookup (original order, no permutation needed)
@@ -388,18 +398,32 @@ end
 Build word-sized comparison data for verifying a perfect-hash match.
 
 Decomposes the common prefix (minimum option length) into word-sized chunks,
-returning `(; verify_table, foldmasks, chunk_types, chunk_positions)` where:
+returning `(; verify_table, foldmasks, chunks)` where:
 - `verify_table`: `NTuple{N, NTuple{C, UInt}}` — per-option expected values for each chunk
 - `foldmasks`: `NTuple{C, UInt}` — casefold OR masks for each chunk
-- `chunk_types`: `Vector{DataType}` — integer type for each chunk load
-- `chunk_positions`: `Vector{Int}` — byte position for each chunk load
+- `chunks`: `Vector{@NamedTuple{offset, width, iT}}` — position, byte width, and integer type for each chunk load
 """
-function gen_verify_table(options::Vector{String}, casefold::Bool)
-    chunks = word_chunks(minimum(ncodeunits, options))
+function gen_verify_table(options::Vector{String}, casefold::Bool;
+                          skip::Union{Nothing, Tuple{Int, Int}} = nothing)
+    minlen = minimum(ncodeunits, options)
+    chunks = if isnothing(skip)
+        word_chunks(minlen)
+    else
+        # Split into chunks covering [0, gap) and [gap+width, total),
+        # with right-side offsets adjusted to original string positions
+        gap_offset, gap_width = skip
+        left = word_chunks(gap_offset)
+        right = word_chunks(minlen - gap_offset - gap_width)
+        right_base = gap_offset + gap_width
+        for i in eachindex(right)
+            right[i] = (; right[i]..., offset = right[i].offset + right_base)
+        end
+        vcat(left, right)
+    end
     verify_table = Tuple(Tuple(pack_bytes(opt, c.offset, c.width, c.iT) for c in chunks) for opt in options)
     foldmasks = Tuple(
         if casefold
-            reduce(|, (c.iT(ifelse(any(opt -> codeunit(opt, c.offset + j + 1) in 0x61:0x7a, options), 0x20, 0x00)) << (8j) for j in 0:c.width-1), init=zero(c.iT))
+            reduce(|, (c.iT(ifelse(any(opt -> codeunit(opt, c.offset + j + 1) in UInt8('a'):UInt8('z'), options), 0x20, 0x00)) << (8j) for j in 0:c.width-1), init=zero(c.iT))
         else
             zero(c.iT)
         end
@@ -460,7 +484,7 @@ function gen_tail_verify(options::Vector{String}, minoptlen::Int, casefold::Bool
             for oi in eachindex(options))
         foldmasks = Tuple(
             if casefold
-                reduce(|, (c.iT(ifelse(any(t -> codeunit(t, c.offset + j + 1) in 0x61:0x7a, nonempty_tails), 0x20, 0x00)) << (8j) for j in 0:c.width-1), init=zero(c.iT))
+                reduce(|, (c.iT(ifelse(any(t -> codeunit(t, c.offset + j + 1) in UInt8('a'):UInt8('z'), nonempty_tails), 0x20, 0x00)) << (8j) for j in 0:c.width-1), init=zero(c.iT))
             else
                 zero(c.iT)
             end
@@ -483,13 +507,13 @@ function gen_tail_verify(options::Vector{String}, minoptlen::Int, casefold::Bool
         tailtable = Tuple(Tuple(codeunits(t)) for t in tails)
         taillenst = Tuple(taillens)
         loadbyte = if casefold
-            :(idbytes[pos + $minoptlen + j - 1] | 0x20)
+            :(@inbounds idbytes[pos + $minoptlen + j - 1] | 0x20)
         else
-            :(idbytes[pos + $minoptlen + j - 1])
+            :(@inbounds idbytes[pos + $minoptlen + j - 1])
         end
         ExprVarLine[:(tailbytes = $tailtable[i]),
                      :(for j in 1:$taillenst[i]
-                           if $loadbyte != tailbytes[j]
+                           if $loadbyte != @inbounds tailbytes[j]
                                found = false
                                break
                            end
@@ -546,10 +570,15 @@ function defid_choice!(exprs::IdExprs,
         load = load_word(ph.iT, phposexpr)
         foldedload = if !iszero(ph.foldmask); :($load | $(ph.foldmask)) else load end
         hashval = ph.hashexpr(foldedload)
-        vt = gen_verify_table(matchoptions, casefold)
-        ve = gen_verify_exprs(vt, fieldvar)
         minoptlen = minimum(ncodeunits, matchoptions)
         variable_len = minoptlen != maximum(ncodeunits, matchoptions)
+        # For injective hashes, skip bytes already validated by the hash window
+        hash_skip = if ph.injective
+            find_best_hash_skip(minoptlen, phoff, sizeof(ph.iT))
+        else
+            nothing
+        end
+        vt = gen_verify_table(matchoptions, casefold; skip = hash_skip)
         tailcheck = if variable_len
             gen_tail_verify(matchoptions, minoptlen, casefold, fieldvar)
         else
@@ -571,17 +600,21 @@ function defid_choice!(exprs::IdExprs,
         # Collect matcher expressions, skipping absent optional parts
         parts = ExprVarLine[resolve_i...]
         if variable_len
+            optlencheck = defid_lengthcheck(ctx, :optlen, minoptlen, maximum(ncodeunits, matchoptions))
             push!(parts,
                   :(if found
                         optlen = $(optlens)[i]
-                        found = nbytes - pos + 1 >= optlen
+                        found = $optlencheck
                     end))
         end
-        push!(parts,
-              :(if found
-                    $(ve.destructure...)
-                    found = $(ve.checks)
-                end))
+        if !isempty(vt.chunks)
+            ve = gen_verify_exprs(vt, fieldvar)
+            push!(parts,
+                  :(if found
+                        $(ve.destructure...)
+                        found = $(ve.checks)
+                    end))
+        end
         if variable_len
             push!(parts, tailcheck)
         end
@@ -595,7 +628,7 @@ function defid_choice!(exprs::IdExprs,
         opts = casefold ? matchoptions : soptions
         optlens = Tuple(ncodeunits.(opts))
         optcus = Tuple(Tuple(codeunits(s)) for s in opts)
-        loadbyte = casefold ? :(idbytes[pos + j - 1] | 0x20) : :(idbytes[pos + j - 1])
+        loadbyte = casefold ? :(@inbounds idbytes[pos + j - 1] | 0x20) : :(@inbounds idbytes[pos + j - 1])
         ExprVarLine[:(for (i, (prefixlen, prefixbytes)) in enumerate(zip($optlens, $optcus))
               nbytes - pos + 1 >= prefixlen || continue
               found = true
@@ -616,15 +649,17 @@ function defid_choice!(exprs::IdExprs,
     else
         :($option = false)
     end
+    minoptbytes = minimum(ncodeunits, soptions)
+    lencheck = defid_lengthcheck(ctx, minoptbytes)
     checkedmatch = if allowempty
-        :(if nbytes - pos + 1 >= $(minimum(ncodeunits, soptions))
+        :(if $lencheck
               $(matcher...)
               if $fieldvar == zero($choiceint)
                   $notfound
               end
           end)
     else
-        :(if nbytes - pos + 1 < $(minimum(ncodeunits, soptions))
+        :(if !$lencheck
               $notfound
           else
               $(matcher...)
@@ -637,6 +672,8 @@ function defid_choice!(exprs::IdExprs,
         nbits = (ctx[:bits][] += choicebits)
         ctx[:print_bytes_min][] += minimum(ncodeunits, soptions)
         ctx[:print_bytes_max][] += maximum(ncodeunits, soptions)
+        ctx[:parsed_bytes_min][] += minimum(ncodeunits, soptions)
+        ctx[:parsed_bytes_max][] += maximum(ncodeunits, soptions)
         push!(exprs.parse,
               :($fieldvar = zero($choiceint)),
               checkedmatch,
@@ -645,18 +682,13 @@ function defid_choice!(exprs::IdExprs,
         push!(ctx[:segments], (choicebits, :choice, Symbol(chopprefix(String(fieldvar), "attr_")),
                                join(soptions, " | ")))
         if isnothing(option)
-            push!(exprs.print,
-                  fextract,
-                  :(print(io, @inbounds $(Tuple(soptions))[$fieldvar])),
-                  :(__segment_printed = $(length(ctx[:segments]))))
+            push!(exprs.print, fextract)
         else
-            push!(ctx[:oprint_detect],
-                fextract,
-                :($option = !iszero($fieldvar)))
-            push!(exprs.print,
-                  :(print(io, @inbounds $(Tuple(soptions))[$fieldvar])),
-                  :(__segment_printed = $(length(ctx[:segments]))))
+            push!(ctx[:oprint_detect], fextract, :($option = !iszero($fieldvar)))
         end
+        push!(exprs.print,
+              :(print(io, @inbounds $(Tuple(soptions))[$fieldvar])),
+              :(__segment_printed = $(length(ctx[:segments]))))
         if haskey(ctx, :fieldvals)
             symoptions = Tuple(Symbol.(soptions))
             push!(ctx[:fieldvals],
@@ -676,6 +708,8 @@ function defid_choice!(exprs::IdExprs,
         end
         ctx[:print_bytes_min][] += ncodeunits(target)
         ctx[:print_bytes_max][] += ncodeunits(target)
+        ctx[:parsed_bytes_min][] += minimum(ncodeunits, soptions)
+        ctx[:parsed_bytes_max][] += maximum(ncodeunits, soptions)
         push!(ctx[:segments], (0, :choice, Symbol(chopprefix(String(fieldvar), "attr_")),
                                "Choice of literal string \"$(target)\" vs $(join(soptions, ", "))"))
         push!(exprs.print, :(print(io, $target)), :(__segment_printed = $(length(ctx[:segments]))))
@@ -687,7 +721,7 @@ end
 """Generate an expression to load a value of type `iT` from `idbytes` at `posexpr`."""
 function load_word(iT::DataType, posexpr::Union{Symbol, Expr})
     if iT === UInt8
-        :(idbytes[$posexpr])
+        :(@inbounds idbytes[$posexpr])
     else
         :(Base.unsafe_load(Ptr{$iT}(pointer(idbytes, $posexpr))))
     end
@@ -713,6 +747,31 @@ function word_chunks(nbytes::Int)
     chunks
 end
 
+"""
+    find_best_hash_skip(optlen, hash_offset, hash_width)
+
+Find the largest byte removal within the hash window `[hash_offset, hash_offset+hash_width)`
+that minimises the total number of word-sized loads needed to verify the remaining bytes.
+Returns `(gap_offset, gap_width)` or `nothing` if no removal reduces the load count.
+"""
+function find_best_hash_skip(optlen::Int, hash_offset::Int, hash_width::Int)
+    nloads(n) = n ÷ sizeof(Int) + count_ones(n % sizeof(Int))
+    baseline = nloads(optlen)
+    baseline == 0 && return (hash_offset, hash_width)
+    best_cost, best_start, best_width = baseline, 0, 0
+    for start in hash_offset:hash_offset + hash_width - 1
+        for w in 1:hash_offset + hash_width - start
+            cost = nloads(start) + nloads(optlen - start - w)
+            if cost < best_cost
+                best_cost = cost
+                best_start = start
+                best_width = w
+            end
+        end
+    end
+    best_cost < baseline ? (best_start, best_width) : nothing
+end
+
 """Pack bytes from `str` at positions `offset+1 : offset+width` into a value of type `iT`."""
 function pack_bytes(str::String, offset::Int, width::Int, iT::DataType)
     v = zero(iT)
@@ -725,24 +784,24 @@ end
 """
     gen_static_stringcomp(str::String, casefold::Bool) -> Vector{Expr}
 
-Generate word-sized mismatch checks for `str` against `idbytes` at `pos`.
-Each expression evaluates to `true` on mismatch. When `casefold` is true,
+Generate word-sized match checks for `str` against `idbytes` at `pos`.
+Each expression evaluates to `true` on match. When `casefold` is true,
 alphabetic bytes are OR-masked with `0x20` before comparison.
 """
 function gen_static_stringcomp(str::String, casefold::Bool)
     map(word_chunks(ncodeunits(str))) do (; offset, width, iT)
         value = pack_bytes(str, offset, width, iT)
         foldmask = if casefold
-            reduce(|, (iT(ifelse(codeunit(str, offset + j + 1) in 0x61:0x7a, 0x20, 0x00)) << (8j) for j in 0:width-1), init=zero(iT))
+            reduce(|, (iT(ifelse(codeunit(str, offset + j + 1) in UInt8('a'):UInt8('z'), 0x20, 0x00)) << (8j) for j in 0:width-1), init=zero(iT))
         else
             zero(iT)
         end
         posexpr = iszero(offset) ? :pos : :(pos + $offset)
         load = load_word(iT, posexpr)
         if !iszero(foldmask)
-            :($load | $foldmask != $value)
+            :($load | $foldmask == $value)
         else
-            :($load != $value)
+            :($load == $value)
         end
     end
 end
@@ -756,40 +815,34 @@ first), with same-length alternatives as nested if/elseif. Assumes `casefold`
 prefixes are already lowercased. Expects `idbytes`, `pos`, `nbytes` in scope.
 """
 function gen_static_lchop(prefixes::Vector{String}; casefold::Bool)
-    # Group by length, longest first
     groups = Dict{Int, Vector{String}}()
     for p in prefixes
         push!(get!(Vector{String}, groups, ncodeunits(p)), p)
     end
     lengths = sort!(collect(keys(groups)), rev=true)
-    # Build one branch per length group
+    matchcond(str) = let checks = gen_static_stringcomp(str, casefold)
+        foldl((a, b) -> :($a && $b), checks)
+    end
     branches = map(lengths) do nb
         grp = groups[nb]
-        # Inner if/elseif for same-length alternatives
-        inner = gen_lchop_match(last(grp), nb, casefold)
-        for i in length(grp)-1:-1:1
-            alt = gen_lchop_match(grp[i], nb, casefold)
-            inner = Expr(:elseif, alt.args[1], alt.args[2], inner)
+        lencheck = :(nbytes - pos + 1 >= $nb)
+        if length(grp) == 1
+            :(if $lencheck && $(matchcond(only(grp))); pos += $nb end)
+        else
+            inner = :(if $(matchcond(last(grp))); pos += $nb end)
+            for i in length(grp)-1:-1:1
+                alt = matchcond(grp[i])
+                inner = Expr(:elseif, alt, :(pos += $nb), inner)
+            end
+            :(if $lencheck; $inner end)
         end
-        :(if nbytes - pos + 1 >= $nb
-              $inner
-          end)
     end
-    # Chain length groups into if/elseif
     result = branches[end]
     for i in length(branches)-1:-1:1
         br = branches[i]
         result = Expr(:if, br.args[1], br.args[2], result)
     end
     result
-end
-
-function gen_lchop_match(prefix::String, nb::Int, casefold::Bool)
-    checks = gen_static_stringcomp(prefix, casefold)
-    mismatch = foldl((a, b) -> :($a || $b), checks)
-    :(if !($mismatch)
-          pos += $nb
-      end)
 end
 
 function defid_literal!(exprs::IdExprs,
@@ -807,11 +860,12 @@ function defid_literal!(exprs::IdExprs,
     end
     litref = casefold ? lowercase(lit) : lit
     checks = gen_static_stringcomp(litref, casefold)
-    mismatch = foldl((a, b) -> :($a || $b), checks)
+    mismatch = :(!($(foldl((a, b) -> :($a && $b), checks))))
     litlen = ncodeunits(litref)
+    lencheck = defid_lengthcheck(ctx, litlen)
     if isnothing(option)
         push!(exprs.parse,
-              :(if nbytes - pos + 1 < $litlen
+              :(if !$lencheck
                     $notfound
                 elseif $mismatch
                     $notfound
@@ -822,7 +876,7 @@ function defid_literal!(exprs::IdExprs,
         append!(exprs.parse,
                 (quote
                      $litvar = true
-                     if nbytes - pos + 1 < $litlen
+                     if !$lencheck
                          $litvar = false
                          $notfound
                      elseif $mismatch
@@ -836,12 +890,14 @@ function defid_literal!(exprs::IdExprs,
     end
     push!(ctx[:segments], (0, :literal, :literal, sprint(show, lit)))
     push!(exprs.print, :(print(io, $lit)), :(__segment_printed = $(length(ctx[:segments]))))
-    ctx[:print_bytes_min][] += ncodeunits(lit)
-    ctx[:print_bytes_max][] += ncodeunits(lit)
+    ctx[:print_bytes_min][] += litlen
+    ctx[:print_bytes_max][] += litlen
+    ctx[:parsed_bytes_min][] += litlen
+    ctx[:parsed_bytes_max][] += litlen
     if haskey(ctx, :fieldvals)
         push!(ctx[:fieldvals],
               if isnothing(option)
-                  :($lit)
+                  lit
               else
                   :(if $option; $lit end)
               end)
@@ -880,6 +936,8 @@ function defid_digits!(exprs::IdExprs,
     end
     option = get(ctx, :optional, nothing)
     range = max - min + 1 + !isnothing(option)
+    # Store raw values when it fits in the same bits as offset encoding
+    directval = cardbits(range) == cardbits(max) && (min > 0 || isnothing(option))
     dbits = sizeof(typeof(range)) * 8 - leading_zeros(range)
     dI = cardtype(8 * sizeof(typeof(max)) - leading_zeros(max))
     fieldvar = get(ctx, :fieldvar, gensym("digits"))
@@ -895,20 +953,21 @@ function defid_digits!(exprs::IdExprs,
     fixedpad = ifelse(fixedwidth, maxdigits, 0)
     printmin = Base.max(ndigits(Base.max(min, 1); base), pad, fixedpad)
     printmax = Base.max(ndigits(max; base), pad, fixedpad)
+    scanlimit = defid_lengthbound(ctx, maxdigits)
     ctx[:print_bytes_min][] += printmin
     ctx[:print_bytes_max][] += printmax
+    ctx[:parsed_bytes_min][] += mindigits
+    ctx[:parsed_bytes_max][] += maxdigits
     fnum = Symbol("$(fieldvar)_num")
     dT = cardtype(dbits)
-    numexpr = if iszero(min) && !isnothing(option)
+    numexpr = if directval
+        if dI != dT; :($fnum % $dT) else fnum end
+    elseif iszero(min) && !isnothing(option)
         :($fnum + $(one(dT)))
     elseif min - !isnothing(option) > 0
-        offset = dT(min - !isnothing(option))
-        :(($fnum - $offset) % $dT)
+        :(($fnum - $(dT(min - !isnothing(option)))) % $dT)
     else
-        fnum
-    end
-    if dI != dT
-        numexpr = :($numexpr % $dT)
+        if dI != dT; :($fnum % $dT) else fnum end
     end
     rangecheck = if min == 0 && max == base^maxdigits - 1
         :()
@@ -926,15 +985,17 @@ function defid_digits!(exprs::IdExprs,
     else
         "up to $maxdigits digits in base $base"
     end
+    directvar = numexpr === fnum
+    parsevar = ifelse(directvar, fnum, fieldvar)
     push!(exprs.parse,
-          :(($bitsconsumed, $fnum) = parseint($dI, idbytes, pos, $base, min($maxdigits, nbytes - pos + 1))))
+          :(($bitsconsumed, $fnum) = parseint($dI, idbytes, pos, $base, $scanlimit)))
     if isnothing(option)
         push!(exprs.parse, :($matchcond || return ($errmsg, pos)))
         rangecheck != :() && push!(exprs.parse, rangecheck)
-        push!(exprs.parse, :($fieldvar = $numexpr))
+        directvar || push!(exprs.parse, :($fieldvar = $numexpr))
     else
         push!(exprs.parse,
-              :($fieldvar = if $matchcond
+              :($parsevar = if $matchcond
                     $option = true
                     $rangecheck
                     $numexpr
@@ -944,25 +1005,28 @@ function defid_digits!(exprs::IdExprs,
                 end))
     end
     push!(exprs.parse,
-          defid_orshift(ctx, dT, fieldvar, nbits),
+          defid_orshift(ctx, dT, parsevar, nbits),
           :(pos += $(fixedwidth ? maxdigits : bitsconsumed)))
     # --- Extract and print ---
     fextract = :($fnum = $(defid_fextract(ctx, nbits, dbits)))
-    fvalue = if dI == dT; fnum else :($fnum % $dI) end
-    if iszero(min) && !isnothing(option)
-        fvalue = :($fvalue - $(one(dI)))
-    elseif min - !isnothing(option) > 0
-        fvalue = :(($fvalue + $(dI(min - !isnothing(option)))) % $dI)
+    fcast = dI == dT ? fnum : :($fnum % $dI)
+    fvalue = if iszero(min) && !isnothing(option)
+        :($fcast - $(one(dI)))
+    elseif !directval && min - !isnothing(option) > 0
+        :(($fcast + $(dI(min - !isnothing(option)))) % $dI)
+    else
+        fcast
     end
+    printvar = ifelse(directvar, fnum, fieldvar)
     printpad = if fixedwidth && maxdigits > 1; maxdigits
     elseif pad > 0; pad
     else 0 end
     printex = if printpad > 0
-        :(print(io, string($fieldvar, base=$base, pad=$printpad)))
+        :(print(io, string($printvar, base=$base, pad=$printpad)))
     elseif base == 10
-        :(print(io, $fieldvar))
+        :(print(io, $printvar))
     else
-        :(print(io, string($fieldvar, base=$base)))
+        :(print(io, string($printvar, base=$base)))
     end
     push!(ctx[:segments], (dbits, :digits, Symbol(chopprefix(String(fieldvar), "attr_")),
                            string(fixedwidth ? "$maxdigits" : "$mindigits-$maxdigits",
@@ -975,20 +1039,14 @@ function defid_digits!(exprs::IdExprs,
                                   elseif max < base^maxdigits - 1
                                       ", at most $(string(max; base, pad))"
                                   else "" end)))
+    segsym = :(__segment_printed = $(length(ctx[:segments])))
     if isnothing(option)
-        push!(exprs.print,
-              fextract, :($fieldvar = $fvalue), printex,
-              :(__segment_printed = $(length(ctx[:segments]))))
+        push!(exprs.print, fextract)
     else
-        push!(ctx[:oprint_detect],
-              fextract, :($option = !iszero($fnum)))
-        push!(exprs.print,
-              :(if $option
-                    $fieldvar = $fvalue
-                    $printex
-                    __segment_printed = $(length(ctx[:segments]))
-                end))
+        push!(ctx[:oprint_detect], fextract, :($option = !iszero($fnum)))
     end
+    directvar || push!(exprs.print, :($fieldvar = $fvalue))
+    push!(exprs.print, printex, segsym)
     if haskey(ctx, :fieldvals)
         propvalue = if max < typemax(dI) ÷ 2
             sI = signed(dI)
@@ -1004,21 +1062,6 @@ function defid_digits!(exprs::IdExprs,
               end)
     end
     nothing
-end
-
-function charseq_config(ctx::Base.ImmutableDict{Symbol, Any}, kind::Symbol)
-    upper = get(ctx, :upper, false)::Bool
-    lower = get(ctx, :lower, false)::Bool
-    casefold = get(ctx, :casefold, false)::Bool
-    upper && lower && throw(ArgumentError("Cannot specify both upper=true and lower=true for $kind"))
-    AZ = UInt8('A'):UInt8('Z')
-    az = UInt8('a'):UInt8('z')
-    d09 = UInt8('0'):UInt8('9')
-    singlecase = upper || lower || casefold
-    letters = if lower && !upper; (az,) elseif singlecase; (AZ,) else (AZ, az) end
-    print_ranges = kind === :letters ? letters : (d09, letters...)
-    nvals = sum(length, print_ranges)
-    (; print_ranges, casefold, nvals)
 end
 
 function defid_charseq!(exprs::IdExprs,
@@ -1038,61 +1081,142 @@ function defid_charseq!(exprs::IdExprs,
     else
         throw(ArgumentError("Expected integer or range for $kind, got $arg"))
     end
-    cfg = charseq_config(ctx, kind)
-    variable = minlen != maxlen
-    bpc = cardbits(cfg.nvals)
-    charbits = maxlen * bpc
-    lenbits = variable ? cardbits(maxlen - minlen + 1) : 0
-    totalbits = charbits + lenbits
-    option = get(ctx, :optional, nothing)
-    if !isnothing(option) && !variable
-        totalbits += 1
+    function charseq_ranges(ctx, kind)
+        upper = get(ctx, :upper, false)::Bool
+        lower = get(ctx, :lower, false)::Bool
+        casefold = get(ctx, :casefold, false)::Bool
+        upper && lower && throw(ArgumentError("Cannot specify both upper=true and lower=true for $kind"))
+        AZ = UInt8('A'):UInt8('Z')
+        az = UInt8('a'):UInt8('z')
+        d09 = UInt8('0'):UInt8('9')
+        singlecase = upper || lower || casefold
+        letters = if lower && !upper; (az,) elseif singlecase; (AZ,) else (AZ, az) end
+        print_ranges = kind === :letters ? letters : (d09, letters...)
+        (; print_ranges, casefold)
     end
+    cfg = charseq_ranges(ctx, kind)
+    variable = minlen != maxlen
+    option = get(ctx, :optional, nothing)
+    nvals = sum(length, cfg.print_ranges)
+    bpc = cardbits(nvals)
+    # When oneindexed, indices start at 1 so zero packed value means absent
+    oneindexed = !isnothing(option) && !variable && cardbits(nvals + 1) == bpc
+    if oneindexed
+        bpc = cardbits(nvals + 1)
+    end
+    charbits = maxlen * bpc
+    # Store length directly when it fits in the same bits as the range offset
+    optoffset = !isnothing(option) && variable && minlen > 0
+    directlen = variable && cardbits(maxlen + 1) == cardbits(maxlen - minlen + 1 + optoffset)
+    lenrange = if !variable
+        0
+    elseif directlen
+        maxlen + 1
+    else
+        maxlen - minlen + 1 + optoffset
+    end
+    lenbits = if variable; cardbits(lenrange) else 0 end
+    presbits = if !isnothing(option) && !variable && !oneindexed; 1 else 0 end
+    totalbits = charbits + lenbits + presbits
     fieldvar = get(ctx, :fieldvar, gensym(string(kind)))
     charvar = Symbol("$(fieldvar)_chars")
     lenvar = Symbol("$(fieldvar)_len")
     cT = cardtype(charbits)
-    lT = variable ? cardtype(lenbits) : Nothing
+    lT = if variable; cardtype(lenbits) else Nothing end
     ranges = cfg.print_ranges
     cfold = cfg.casefold
     nbits_pos = (ctx[:bits][] += totalbits)
+    scanlimit = defid_lengthbound(ctx, maxlen)
     ctx[:print_bytes_min][] += minlen
     ctx[:print_bytes_max][] += maxlen
+    ctx[:parsed_bytes_min][] += minlen
+    ctx[:parsed_bytes_max][] += maxlen
     # --- Parse ---
     push!(exprs.parse,
-          :(($lenvar, $charvar) = parsechars($cT, idbytes, pos, min($maxlen, nbytes - pos + 1), $ranges, $cfold)))
-    notfound = if isnothing(option)
-        :(return ($"Expected $(variable ? "$minlen to $maxlen" : "$maxlen") $kind characters", pos))
+          :(($lenvar, $charvar) = parsechars($cT, idbytes, pos, $scanlimit, $ranges, $cfold, $oneindexed)))
+    errmsg = if variable
+        "Expected $minlen to $maxlen $kind characters"
     else
-        :($option = false)
+        "Expected $maxlen $kind characters"
     end
-    push!(exprs.parse,
-          :(if $lenvar < $minlen; $notfound end))
-    if !variable
+    notfound = if isnothing(option)
+        [:(return ($errmsg, pos))]
+    else
+        [:($option = false), :($charvar = zero($cT)), :($lenvar = 0)]
+    end
+    if !isnothing(option) && variable && minlen == 0
         push!(exprs.parse,
-              :(if $lenvar != $maxlen; $notfound end))
+              :(if $lenvar > 0
+                    $option = true
+                elseif !@isdefined($option)
+                    $option = false
+                end))
+    else
+        if !isnothing(option)
+            push!(exprs.parse, :($option = true))
+        end
+        push!(exprs.parse,
+              :(if $(if variable; :($lenvar < $minlen) else :($lenvar != $maxlen) end)
+                    $(notfound...)
+                end))
+    end
+    lenoffset = Symbol("$(fieldvar)_lenoff")
+    lenbase = if directlen
+        0
+    elseif optoffset
+        minlen - 1
+    else
+        minlen
     end
     push!(exprs.parse,
-          defid_orshift(ctx, cT, charvar, nbits_pos - lenbits),
+          defid_orshift(ctx, cT, charvar, nbits_pos - lenbits - presbits),
           :(pos += $lenvar))
     if variable
-        lenoffset = Symbol("$(fieldvar)_lenoff")
-        push!(exprs.parse,
-              :($lenoffset = ($lenvar - $minlen) % $lT),
+        lenpack = if lenbase == 0
+            :($lenoffset = $lenvar % $lT)
+        else
+            :($lenoffset = ($lenvar - $lenbase) % $lT)
+        end
+        push!(exprs.parse, lenpack,
               defid_orshift(ctx, lT, lenoffset, nbits_pos))
+    elseif presbits > 0
+        push!(exprs.parse,
+              defid_orshift(ctx, Bool, option, nbits_pos))
     end
-    # --- Print ---
-    fextract_chars = :($charvar = $(defid_fextract(ctx, nbits_pos - lenbits, charbits)))
+    # --- Print / extract ---
+    fextract_chars = :($charvar = $(defid_fextract(ctx, nbits_pos - lenbits - presbits, charbits)))
+    extracts = ExprVarLine[fextract_chars]
     if variable
-        fextract_len = :($lenvar = $(defid_fextract(ctx, nbits_pos, lenbits)) + $minlen)
-        push!(exprs.print,
-              fextract_chars, fextract_len,
-              :(printchars(io, $charvar, Int($lenvar), $ranges)))
-    else
-        push!(exprs.print,
-              fextract_chars,
-              :(printchars(io, $charvar, $maxlen, $ranges)))
+        fextract_len = if lenbase == 0
+            :($lenvar = $(defid_fextract(ctx, nbits_pos, lenbits)))
+        else
+            :($lenvar = $(defid_fextract(ctx, nbits_pos, lenbits)) + $lenbase)
+        end
+        push!(extracts, fextract_len)
     end
+    printex = if variable
+        :(printchars(io, $charvar, Int($lenvar), $ranges))
+    else
+        :(printchars(io, $charvar, $maxlen, $ranges, $oneindexed))
+    end
+    tostringex = if variable
+        :(chars2string($charvar, Int($lenvar), $ranges))
+    else
+        :(chars2string($charvar, $maxlen, $ranges, $oneindexed))
+    end
+    present = if variable
+        if minlen == 0; :($lenvar > 0) else :(!iszero($lenvar)) end
+    elseif oneindexed
+        :(!iszero($charvar))
+    else
+        :(!iszero($(defid_fextract(ctx, nbits_pos, presbits))))
+    end
+    if !isnothing(option)
+        push!(ctx[:oprint_detect], extracts..., :($option = $present))
+    else
+        append!(exprs.print, extracts)
+    end
+    push!(exprs.print, printex)
     push!(ctx[:segments],
           (totalbits, kind, Symbol(chopprefix(String(fieldvar), "attr_")),
            string(variable ? "$minlen-$maxlen" : "$maxlen",
@@ -1100,12 +1224,12 @@ function defid_charseq!(exprs::IdExprs,
     push!(exprs.print, :(__segment_printed = $(length(ctx[:segments]))))
     # --- Field value ---
     if haskey(ctx, :fieldvals)
-        fvblock = if variable
-            :($fextract_chars; $fextract_len; chars2string($charvar, Int($lenvar), $ranges))
-        else
-            :($fextract_chars; chars2string($charvar, $maxlen, $ranges))
-        end
-        push!(ctx[:fieldvals], fvblock)
+        push!(ctx[:fieldvals],
+              if isnothing(option)
+                  :($(extracts...); $tostringex)
+              else
+                  :($(extracts...); if $present; $tostringex end)
+              end)
     end
     nothing
 end
@@ -1125,6 +1249,134 @@ function defid_fextract(ctx::Base.ImmutableDict{Symbol, Any}, position::Int, wid
         fTmask = ~(typemax(fT) << width)
         :($ival & $fTmask)
     end
+end
+
+"""
+    defid_lengthcheck(ctx, n_expr, [n_min, n_max])
+
+Emit a `__length_check(n_expr, n_min, n_max, parsed_min, parsed_max)` sentinel resolved by
+`resolve_length_checks!` once the final parse byte minimum is known.
+"""
+function defid_lengthcheck(ctx::Base.ImmutableDict{Symbol, Any}, n_expr, n_min::Int=n_expr, n_max::Int=n_min)
+    Expr(:call, :__length_check, n_expr, n_min, n_max, ctx[:parsed_bytes_min][], ctx[:parsed_bytes_max][])
+end
+
+"""
+    defid_lengthbound(ctx, n)
+
+Emit a `__length_bound(n, parsed_min, parsed_max)` sentinel that resolves to
+`n` when enough bytes are guaranteed, or `min(n, nbytes - pos + 1)` at runtime.
+"""
+function defid_lengthbound(ctx::Base.ImmutableDict{Symbol, Any}, n::Int)
+    Expr(:call, :__length_bound, n, ctx[:parsed_bytes_min][], ctx[:parsed_bytes_max][])
+end
+
+"""
+    resolve_length_checks!(exprs, total_parsed_min)
+
+Walk the AST and resolve `__length_check` sentinels. When the total minimum
+guarantees enough bytes remain (`total_parsed_min - parsed_max >= n_max`),
+the check is statically true; if/elseif branches are simplified accordingly.
+Otherwise, the sentinel is replaced with a runtime `nbytes - pos + 1 >= n_expr`.
+"""
+function resolve_length_checks!(exprlikes::Vector{<:ExprVarLine}, total_parsed_min::Int)
+    elided = false
+    splice_indices = Int[]
+    for (idx, expr) in enumerate(exprlikes)
+        expr isa Expr || continue
+        result, elided = resolve_length_check_expr!(expr, total_parsed_min, elided)
+        if result === :remove
+            push!(splice_indices, idx)
+        elseif !isnothing(result)
+            exprlikes[idx] = result
+        end
+    end
+    deleteat!(exprlikes, splice_indices)
+    exprlikes, elided
+end
+
+# Resolve __length_check to true or a runtime `nbytes - pos + 1 >= n` expression
+function resolve_length_check_value(expr::Expr, total_parsed_min::Int)
+    n_expr, n_min, n_max, parsed_min, parsed_max = expr.args[2:end]
+    total_parsed_min - parsed_max >= n_max ? true : :(nbytes - pos + 1 >= $n_expr)
+end
+
+# Walk and resolve. Returns (replacement, elided) where replacement is
+# :remove, a value to splice in (Expr or literal), or nothing (modified in-place).
+function resolve_length_check_expr!(expr::Expr, total::Int, elided::Bool)
+    # if/elseif with __length_check or !__length_check condition — special
+    # handling to fold away the entire branch when statically known
+    if expr.head in (:if, :elseif)
+        cond = expr.args[1]
+        check, negated = if Meta.isexpr(cond, :call) && first(cond.args) === :__length_check
+            (cond, false)
+        elseif Meta.isexpr(cond, :call, 2) && cond.args[1] === :! &&
+               Meta.isexpr(cond.args[2], :call) && first(cond.args[2].args) === :__length_check
+            (cond.args[2], true)
+        else
+            (nothing, false)
+        end
+        if !isnothing(check)
+            val = resolve_length_check_value(check, total)
+            if val isa Bool
+                # Statically known — keep the taken branch, discard the other
+                elided = true
+                taken = xor(val, negated)
+                promoted = if taken
+                    expr.args[2]
+                elseif length(expr.args) >= 3
+                    elsebranch = expr.args[3]
+                    if elsebranch isa Expr && elsebranch.head === :elseif
+                        elsebranch.head = :if
+                    end
+                    elsebranch
+                else
+                    nothing
+                end
+                isnothing(promoted) && return :remove, elided
+                # Recurse into the promoted branch to resolve any nested sentinels
+                if promoted isa Expr
+                    result, elided = resolve_length_check_expr!(promoted, total, elided)
+                    !isnothing(result) && (promoted = result)
+                end
+                return promoted, elided
+            end
+            # Runtime — replace sentinel with actual comparison
+            expr.args[1] = negated ? :(nbytes - pos + 1 < $(check.args[2])) : val
+        end
+    end
+    # Recurse into all children, resolving sentinels wherever they appear
+    splice_indices = Int[]
+    for (i, arg) in enumerate(expr.args)
+        arg isa Expr || continue
+        if Meta.isexpr(arg, :call) && first(arg.args) === :__length_check
+            val = resolve_length_check_value(arg, total)
+            elided |= val isa Bool
+            if val isa Expr
+                arg.head, arg.args = val.head, val.args
+            else
+                expr.args[i] = val
+            end
+        elseif Meta.isexpr(arg, :call) && first(arg.args) === :__length_bound
+            n, parsed_min, parsed_max = arg.args[2:end]
+            if total - parsed_max >= n
+                elided = true
+                expr.args[i] = n
+            else
+                replacement = :(min($n, nbytes - pos + 1))
+                arg.head, arg.args = replacement.head, replacement.args
+            end
+        else
+            result, elided = resolve_length_check_expr!(arg, total, elided)
+            if result === :remove
+                push!(splice_indices, i)
+            elseif !isnothing(result)
+                expr.args[i] = result
+            end
+        end
+    end
+    deleteat!(expr.args, splice_indices)
+    nothing, elided
 end
 
 function implement_casting!(expr::Expr, name::Symbol, finalsize::Int)
@@ -1160,7 +1412,26 @@ function implement_casting!(ctx::Base.ImmutableDict{Symbol, Any}, exprlikes::Vec
 end
 
 function defid_parsebytes(pexprs::Vector{ExprVarLine}, ctx::Base.ImmutableDict{Symbol, Any}, name::Symbol)
-    :(function $(GlobalRef(@__MODULE__, :parsebytes))(::Type{$(esc(name))}, idbytes::AbstractVector{UInt8})
+    parsed_min = ctx[:parsed_bytes_min][]
+    resolved, elided = resolve_length_checks!(implement_casting!(ctx, pexprs), parsed_min)
+    # Split at __upfront_lengthcheck sentinel, replacing it with the actual check
+    errmsg = string("Expected at least ", parsed_min, " bytes")
+    split_idx = findfirst(e -> Meta.isexpr(e, :call) && first(e.args) === :__upfront_lengthcheck, resolved)
+    if !isnothing(split_idx) && elided
+        check = if split_idx > 1
+            :(nbytes - pos >= $(parsed_min - 1) || return ($errmsg, 1))
+        else
+            :(nbytes >= $parsed_min || return ($errmsg, 1))
+        end
+        resolved[split_idx] = check
+    else
+        # No leading skips or no elision — remove the sentinel
+        !isnothing(split_idx) && deleteat!(resolved, split_idx)
+        if elided
+            pushfirst!(resolved, :(nbytes >= $parsed_min || return ($errmsg, 1)))
+        end
+    end
+    :(Base.@assume_effects :foldable :nothrow function $(GlobalRef(@__MODULE__, :parsebytes))(::Type{$(esc(name))}, idbytes::AbstractVector{UInt8})
           parsed = $(if ctx[:bits][] <= 8
                          :(Core.bitcast($(esc(ctx[:name])), 0x00))
                      else
@@ -1168,7 +1439,7 @@ function defid_parsebytes(pexprs::Vector{ExprVarLine}, ctx::Base.ImmutableDict{S
                      end)
           pos = 1
           nbytes = length(idbytes)
-          $(implement_casting!(ctx, pexprs)...)
+          $(resolved...)
           (parsed, pos)
       end)
 end
@@ -1257,13 +1528,15 @@ function bufprint(buf::Memory{UInt8}, pos::Int, str::String)
 end
 
 function bufprintchars(buf::Memory{UInt8}, pos::Int, packed::P, nchars::Int,
-                       ranges::NTuple{N, UnitRange{UInt8}}) where {P <: Unsigned, N}
+                       ranges::NTuple{N, UnitRange{UInt8}},
+                       oneindexed::Bool = false) where {P <: Unsigned, N}
     nvals = sum(length, ranges)
-    bpc = cardbits(nvals)
+    bpc = cardbits(nvals + oneindexed)
     topshift = 8 * sizeof(P) - bpc
     packed <<= 8 * sizeof(P) - nchars * bpc
+    offset = UInt8(oneindexed)
     @inbounds for _ in 1:nchars
-        idx = UInt8(packed >> topshift)
+        idx = UInt8(packed >> topshift) - offset
         for r in ranges
             rlen = length(r) % UInt8
             if idx < rlen
@@ -1279,12 +1552,12 @@ end
 
 Base.@constprop :aggressive function bufprint(buf::Memory{UInt8}, pos::Int, num::Integer, base::Int = 10, pad::Int = 0)
     @inline int2byte(d) = if d < 10
-        0x30 + d % UInt8
+        UInt8('0') + d % UInt8
     elseif base <= 36
-        0x57 + d % UInt8  # 'a' - 10
+        UInt8('a') - 0x0a + d % UInt8
     else
         db = d % UInt8
-        ifelse(db < 36, 0x57 + db, 0x3d + db)  # 'a' - 10 / 'A' - 36
+        ifelse(db < 36, UInt8('a') - 0x0a + db, UInt8('a') - 0x24 + db)
     end
     nd = ndigits(num; base)
     width = Base.max(nd, pad)
@@ -1296,7 +1569,7 @@ Base.@constprop :aggressive function bufprint(buf::Memory{UInt8}, pos::Int, num:
         i -= 1
     end
     @inbounds while i > pos
-        buf[i] = 0x30
+        buf[i] = UInt8('0')
         i -= 1
     end
     endpos
@@ -1325,7 +1598,6 @@ function defid_shortcode(pexprs::Vector{ExprVarLine}, ctx::Base.ImmutableDict{Sy
     # stripping __segment_printed assignments used only by segments()
     bufexprs = map(strip_segsets! ∘ copy, pexprs)
     filter!(e -> !Meta.isexpr(e, :(=), 2) || first(e.args) !== :__segment_printed, bufexprs)
-    implement_casting!(ctx, bufexprs)
     defid_bufprint!(bufexprs)
     tobytes_def = :(function $(GlobalRef(@__MODULE__, :tobytes))(id::$(esc(name)))
           buf = $(fixedlen ? :(Base.StringMemory($maxbytes)) : :(Memory{UInt8}(undef, $maxbytes)))
@@ -1356,20 +1628,13 @@ end
 
 function defid_properties(pexprs::Vector{Pair{Symbol, Vector{ExprVarLine}}}, ctx::Base.ImmutableDict{Symbol, Any}, name::Symbol)
     isempty(pexprs) && return :()
-    clauses = nothing
-    currentif = nothing
-    for (prop, exprs) in pexprs
+    # Build the if/elseif chain from the bottom up: innermost elseif first, outermost if last
+    fallback = :(throw(FieldError($(esc(name)), prop)))
+    clauses = foldr(enumerate(pexprs), init = fallback) do (i, (prop, exprs)), rest
         qprop = QuoteNode(prop)
-        if isnothing(currentif)
-            clauses = Expr(:if, :(prop === $qprop), Expr(:block, implement_casting!(ctx, exprs)...))
-            currentif = clauses
-        else
-            nextif = Expr(:elseif,:(prop === $qprop), Expr(:block, implement_casting!(ctx, exprs)...))
-            push!(currentif.args, nextif)
-            currentif = nextif
-        end
+        body = Expr(:block, implement_casting!(ctx, exprs)...)
+        Expr(ifelse(i == 1, :if, :elseif), :(prop === $qprop), body, rest)
     end
-    push!(currentif.args, :(throw(FieldError($(esc(name)), prop))))
     :(function $(GlobalRef(Base, :getproperty))(id::$(esc(name)), prop::Symbol)
           $clauses
       end)
@@ -1419,16 +1684,10 @@ function defid_segments_value(ctx::Base.ImmutableDict{Symbol, Any}, pexprs::Vect
 end
 
 function defid_make(exprs::IdExprs, ctx::Base.ImmutableDict{Symbol, Any}, name::Symbol)
-    block = Expr(:block) # :toplevel
+    block = Expr(:toplevel)
     numbits = 8 * cld(ctx[:bits][], 8)
     prefix = get(ctx, :purlprefix, nothing)
-    stripname = get(ctx, :stripname, true)::Bool
-    skipprefixes = String[]
-    !isnothing(prefix) && push!(skipprefixes, lowercase(prefix))
-    stripname && push!(skipprefixes, lowercase(string(name)) * ":")
-    if !isempty(skipprefixes)
-        pushfirst!(exprs.parse, gen_static_lchop(skipprefixes, casefold=true))
-    end
+    implement_casting!(ctx, exprs.print)
     push!(block.args,
           :(Base.@__doc__(primitive type $(esc(name)) <: $AbstractIdentifier $numbits end)),
           :($(GlobalRef(@__MODULE__, :nbits))(::Type{$(esc(name))}) = $(ctx[:bits][])),
