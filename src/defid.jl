@@ -116,6 +116,21 @@ Base.@assume_effects :foldable function cardtype(minbits::Int)
     (UInt8, UInt16, UInt32, UInt64, UInt128)[logtypesize]
 end
 
+"""The smallest unsigned integer type that can hold `nd` bytes."""
+function swar_type(num_digits::Integer)
+    if num_digits <= 1
+        UInt8
+    elseif num_digits <= 2
+        UInt16
+    elseif num_digits <= 4
+        UInt32
+    elseif num_digits <= 8
+        UInt64
+    else
+        throw(ArgumentError("Cannot handle more than 8 bytes with SWAR techniques, but $num_digits bytes were requested"))
+    end
+end
+
 """Register a compile-time error message and return its 1-based index for use as an error code."""
 function defid_errmsg(ctx::Base.ImmutableDict{Symbol, Any}, msg::String)
     errmsgs = ctx[:errconsts]
@@ -245,14 +260,20 @@ function defid_optional!(exprs::IdExprs,
     end
     ctx[:print_bytes_min][] = saved_print_min
     ctx[:parsed_bytes_min][] = saved_parse_min
+    optvar = ctx[:optional]
+    # Rewind pos when the optional has multiple nodes: an early node may advance
+    # pos before a later node fails and sets option=false. Not needed when the
+    # all-strings path converted to a choice (single-node handling).
+    needs_rewind = length(args) > 1 && !all(a -> a isa String, args)
+    savedpos = needs_rewind ? gensym("savedpos") : nothing
+    needs_rewind && push!(exprs.parse, :($savedpos = pos))
+    push!(exprs.parse, :($optvar = true))
     if isnothing(popt)
         append!(exprs.parse, oexprs.parse)
     else
-        push!(exprs.parse,
-              :(if $popt
-                    $(oexprs.parse...)
-                end))
+        push!(exprs.parse, :(if $popt; $(oexprs.parse...) end))
     end
+    needs_rewind && push!(exprs.parse, :($optvar || (pos = $savedpos)))
     append!(exprs.print, ctx[:oprint_detect])
     push!(exprs.print, :(if $(ctx[:optional]); $(oexprs.print...) end))
     nothing
@@ -401,24 +422,28 @@ function classify_hash(hvals::Vector{UInt64}, nopts::Int, options::Vector{String
 end
 
 """
-    gen_verify_table(options::Vector{String}, casefold::Bool)
+    gen_verify_table(options::Vector{String}, casefold::Bool; skip, nbytes)
 
 Build word-sized comparison data for verifying a perfect-hash match.
 
-Decomposes the common prefix (minimum option length) into word-sized chunks,
-returning `(; verify_table, foldmasks, chunks)` where:
-- `verify_table`: `NTuple{N, NTuple{C, UInt}}` — per-option expected values for each chunk
-- `foldmasks`: `NTuple{C, UInt}` — casefold OR masks for each chunk
-- `chunks`: `Vector{@NamedTuple{offset, width, iT}}` — position, byte width, and integer type for each chunk load
+Uses `load & mask == expected` convention: per-byte mask is `0xFF` (exact),
+`0xDF` (case-insensitive), or `0x00` (overflow/ignore).
+
+When `nbytes > minimum(ncodeunits, options)`, the no-skip chunks are widened,
+with overflow bytes masked to `0x00`.
+
+Returns `(; verify_table, masks, chunks)`.
 """
 function gen_verify_table(options::Vector{String}, casefold::Bool;
-                          skip::Union{Nothing, Tuple{Int, Int}} = nothing)
+                          skip::Union{Nothing, Tuple{Int, Int}} = nothing,
+                          nbytes::Int = minimum(ncodeunits, options))
     minlen = minimum(ncodeunits, options)
     chunks = if isnothing(skip)
-        word_chunks(minlen)
+        word_chunks(nbytes)
     else
         # Split into chunks covering [0, gap) and [gap+width, total),
-        # with right-side offsets adjusted to original string positions
+        # with right-side offsets adjusted to original string positions.
+        # Widening is not applied when skip is active.
         gap_offset, gap_width = skip
         left = word_chunks(gap_offset)
         right = word_chunks(minlen - gap_offset - gap_width)
@@ -428,15 +453,23 @@ function gen_verify_table(options::Vector{String}, casefold::Bool;
         end
         vcat(left, right)
     end
-    verify_table = Tuple(Tuple(pack_bytes(opt, c.offset, c.width, c.iT) for c in chunks) for opt in options)
-    foldmasks = Tuple(
-        if casefold
-            reduce(|, (c.iT(ifelse(any(opt -> codeunit(opt, c.offset + j + 1) in UInt8('a'):UInt8('z'), options), 0x20, 0x00)) << (8j) for j in 0:c.width-1), init=zero(c.iT))
-        else
-            zero(c.iT)
-        end
+    masks = Tuple(
+        reduce(|, (begin
+            valid = c.offset + j < minlen
+            byte_mask = if valid
+                casefold && any(opt -> codeunit(opt, c.offset + j + 1) in UInt8('a'):UInt8('z'), options) ?
+                    c.iT(0xDF) : c.iT(0xFF)
+            else
+                zero(c.iT)
+            end
+            byte_mask << (8j)
+        end for j in 0:c.width-1), init=zero(c.iT))
         for c in chunks)
-    (; verify_table, foldmasks, chunks)
+    verify_table = Tuple(
+        Tuple(pack_bytes(opt, c.offset, min(c.width, max(0, minlen - c.offset)), c.iT) & m
+              for (c, m) in zip(chunks, masks))
+        for opt in options)
+    (; verify_table, masks, chunks)
 end
 
 """
@@ -444,22 +477,28 @@ end
 
 Generate AST for destructured comparison of word-sized chunks.
 
-Assumes `idbytes` is in scope. Returns:
+Uses `load & mask == expected` convention. Assumes `idbytes` is in scope.
+Returns:
 - `destructure`: assignments that extract per-option expected values from the verify table
 - `checks`: a boolean expression that is `true` when all chunks match
 """
 function gen_verify_exprs(vt, prefix::Symbol)
     nchunks = length(vt.chunks)
     cvars = [Symbol(prefix, "_expect", ci) for ci in 1:nchunks]
-    fmvars = [Symbol(prefix, "_fmask", ci) for ci in 1:nchunks]
+    mvars = [Symbol(prefix, "_mask", ci) for ci in 1:nchunks]
     destructure = [
         Expr(:(=), Expr(:tuple, cvars...), :($(vt.verify_table)[i])),
-        Expr(:(=), Expr(:tuple, fmvars...), vt.foldmasks)]
+        Expr(:(=), Expr(:tuple, mvars...), vt.masks)]
     checks = foldr(1:nchunks, init = :(true)) do ci, rest
-        (; offset, iT) = vt.chunks[ci]
+        (; offset, width, iT) = vt.chunks[ci]
         posexpr = iszero(offset) ? :pos : :(pos + $offset)
         load = load_word(iT, posexpr)
-        check = :($load | $(fmvars[ci]) == $(cvars[ci]))
+        m = vt.masks[ci]
+        check = if m == typemax(iT)
+            :($load == $(cvars[ci]))
+        else
+            :($load & $(mvars[ci]) == $(cvars[ci]))
+        end
         rest == :(true) ? check : :($check && $rest)
     end
     (; destructure, checks)
@@ -478,35 +517,44 @@ function gen_tail_verify(options::Vector{String}, minoptlen::Int, casefold::Bool
     has_empty = any(iszero, taillens)
     distinct_taillens = unique(filter(!iszero, taillens))
     body = if length(distinct_taillens) == 1
-        # Single tail length: word-sized comparison
+        # Single tail length: word-sized comparison with & mask convention
         taillen = only(distinct_taillens)
         chunks = word_chunks(taillen)
         nonempty_tails = filter(!isempty, tails)
+        masks = Tuple(
+            reduce(|, (begin
+                byte_mask = if casefold && any(t -> codeunit(t, c.offset + j + 1) in UInt8('a'):UInt8('z'), nonempty_tails)
+                    c.iT(0xDF)
+                else
+                    c.iT(0xFF)
+                end
+                byte_mask << (8j)
+            end for j in 0:c.width-1), init=zero(c.iT))
+            for c in chunks)
         zerotup = Tuple(zero(c.iT) for c in chunks)
         tailtable = Tuple(
             if isempty(tails[oi])
                 zerotup
             else
-                Tuple(pack_bytes(tails[oi], c.offset, c.width, c.iT) for c in chunks)
+                Tuple(pack_bytes(tails[oi], c.offset, c.width, c.iT) & m
+                      for (c, m) in zip(chunks, masks))
             end
             for oi in eachindex(options))
-        foldmasks = Tuple(
-            if casefold
-                reduce(|, (c.iT(ifelse(any(t -> codeunit(t, c.offset + j + 1) in UInt8('a'):UInt8('z'), nonempty_tails), 0x20, 0x00)) << (8j) for j in 0:c.width-1), init=zero(c.iT))
-            else
-                zero(c.iT)
-            end
-            for c in chunks)
         tvars = [Symbol(prefix, "_tail", ci) for ci in 1:length(chunks)]
         tmvars = [Symbol(prefix, "_tmask", ci) for ci in 1:length(chunks)]
         destructure = [
             Expr(:(=), Expr(:tuple, tvars...), :($tailtable[i])),
-            Expr(:(=), Expr(:tuple, tmvars...), foldmasks)]
+            Expr(:(=), Expr(:tuple, tmvars...), masks)]
         checks = foldr(1:length(chunks), init = :(true)) do ci, rest
-            (; offset, iT) = chunks[ci]
+            (; offset, width, iT) = chunks[ci]
             posexpr = :(pos + $(minoptlen + offset))
             load = load_word(iT, posexpr)
-            check = :($load | $(tmvars[ci]) == $(tvars[ci]))
+            m = masks[ci]
+            check = if m == typemax(iT)
+                :($load == $(tvars[ci]))
+            else
+                :($load & $(tmvars[ci]) == $(tvars[ci]))
+            end
             rest == :(true) ? check : :($check && $rest)
         end
         ExprVarLine[destructure..., :(found = $checks)]
@@ -587,6 +635,15 @@ function defid_choice!(exprs::IdExprs,
             nothing
         end
         vt = gen_verify_table(matchoptions, casefold; skip = hash_skip)
+        # Try widening the verify table when it reduces chunk count
+        wide_minlen = min(nextpow(2, minoptlen), sizeof(UInt) * cld(minoptlen, sizeof(UInt)))
+        use_wide_vt = isnothing(hash_skip) && wide_minlen > minoptlen &&
+            length(word_chunks(wide_minlen)) < length(vt.chunks)
+        vt_wide = if use_wide_vt
+            gen_verify_table(matchoptions, casefold; nbytes = wide_minlen)
+        else
+            nothing
+        end
         tailcheck = if variable_len
             gen_tail_verify(matchoptions, minoptlen, casefold, fieldvar)
         else
@@ -617,11 +674,23 @@ function defid_choice!(exprs::IdExprs,
         end
         if !isempty(vt.chunks)
             ve = gen_verify_exprs(vt, fieldvar)
-            push!(parts,
-                  :(if found
-                        $(ve.destructure...)
-                        found = $(ve.checks)
-                    end))
+            verify_block = Expr(:block, ve.destructure..., :(found = $(ve.checks)))
+            if use_wide_vt
+                ve_wide = gen_verify_exprs(vt_wide, fieldvar)
+                wide_block = Expr(:block, ve_wide.destructure..., :(found = $(ve_wide.checks)))
+                chosen = Expr(:call, :__ifelse_length_exceeds, wide_minlen,
+                              ctx[:parsed_bytes_min][], ctx[:parsed_bytes_max][],
+                              wide_block, verify_block)
+                push!(parts,
+                      :(if found
+                            $chosen
+                        end))
+            else
+                push!(parts,
+                      :(if found
+                            $(verify_block.args...)
+                        end))
+            end
         end
         if variable_len
             push!(parts, tailcheck)
@@ -791,26 +860,40 @@ function pack_bytes(str::String, offset::Int, width::Int, iT::DataType)
 end
 
 """
-    gen_static_stringcomp(str::String, casefold::Bool) -> Vector{Expr}
+    gen_static_stringcomp(str::String, casefold::Bool, nbytes::Int=ncodeunits(str)) -> Vector{Expr}
 
 Generate word-sized match checks for `str` against `idbytes` at `pos`.
-Each expression evaluates to `true` on match. When `casefold` is true,
-alphabetic bytes are OR-masked with `0x20` before comparison.
+Each expression evaluates to `true` on match.
+
+Uses `load & mask == expected` convention: per-byte mask is `0xFF` (exact),
+`0xDF` (case-insensitive), or `0x00` (overflow/ignore).
+
+When `nbytes > ncodeunits(str)`, chunks are computed for `nbytes` and overflow
+bytes are masked to `0x00`. This enables widened loads (e.g. a single UInt64
+for a 7-byte string) when subsequent pattern nodes guarantee that extra bytes
+exist in the input.
 """
-function gen_static_stringcomp(str::String, casefold::Bool)
-    map(word_chunks(ncodeunits(str))) do (; offset, width, iT)
-        value = pack_bytes(str, offset, width, iT)
-        foldmask = if casefold
-            reduce(|, (iT(ifelse(codeunit(str, offset + j + 1) in UInt8('a'):UInt8('z'), 0x20, 0x00)) << (8j) for j in 0:width-1), init=zero(iT))
-        else
-            zero(iT)
-        end
+function gen_static_stringcomp(str::String, casefold::Bool, nbytes::Int = ncodeunits(str))
+    strlen = ncodeunits(str)
+    map(word_chunks(nbytes)) do (; offset, width, iT)
+        valid = min(width, strlen - offset)
+        # Per-byte mask: 0xDF for casefolded alpha, 0xFF for exact, 0x00 for overflow
+        mask = reduce(|, (begin
+            byte_mask = if j < valid
+                casefold && codeunit(str, offset + j + 1) in UInt8('a'):UInt8('z') ?
+                    iT(0xDF) : iT(0xFF)
+            else
+                zero(iT)
+            end
+            byte_mask << (8j)
+        end for j in 0:width-1), init=zero(iT))
+        value = pack_bytes(str, offset, valid, iT) & mask
         posexpr = iszero(offset) ? :pos : :(pos + $offset)
         load = load_word(iT, posexpr)
-        if !iszero(foldmask)
-            :($load | $foldmask == $value)
-        else
+        if mask == typemax(iT)
             :($load == $value)
+        else
+            :($load & $mask == $value)
         end
     end
 end
@@ -869,9 +952,23 @@ function defid_literal!(exprs::IdExprs,
         all(isascii, lit) || throw(ArgumentError("Expected ASCII string for literal with casefolding"))
     end
     litref = casefold ? lowercase(lit) : lit
-    checks = gen_static_stringcomp(litref, casefold)
-    mismatch = :(!($(foldl((a, b) -> :($a && $b), checks))))
     litlen = ncodeunits(litref)
+    # When widening to fewer loads is possible, emit both paths and let
+    # __ifelse_length_exceeds pick at resolution time
+    wide_n = min(nextpow(2, litlen), sizeof(UInt) * cld(litlen, sizeof(UInt)))
+    use_wide = wide_n > litlen && length(word_chunks(wide_n)) < length(word_chunks(litlen))
+    mismatch = if use_wide
+        wide_checks = gen_static_stringcomp(litref, casefold, wide_n)
+        wide_mm = :(!($(foldl((a, b) -> :($a && $b), wide_checks))))
+        narrow_checks = gen_static_stringcomp(litref, casefold)
+        narrow_mm = :(!($(foldl((a, b) -> :($a && $b), narrow_checks))))
+        Expr(:call, :__ifelse_length_exceeds, wide_n,
+             ctx[:parsed_bytes_min][], ctx[:parsed_bytes_max][],
+             wide_mm, narrow_mm)
+    else
+        checks = gen_static_stringcomp(litref, casefold)
+        :(!($(foldl((a, b) -> :($a && $b), checks))))
+    end
     lencheck = defid_lengthcheck(ctx, litlen)
     if isnothing(option)
         push!(exprs.parse,
@@ -915,6 +1012,814 @@ function defid_literal!(exprs::IdExprs,
     nothing
 end
 
+"""
+    swarparse_consts(::Type{T}, base::Int, ndigits::Int)
+
+Compute constants for SWAR (SIMD Within A Register) parallel ASCII-to-integer
+conversion of `ndigits` digit bytes high-aligned in unsigned type `T`.
+
+The caller should load `sizeof(T)` bytes ending at the last digit, so that the
+`ndigits` digit bytes occupy the high byte positions and the low
+`sizeof(T) - ndigits` bytes are garbage. The `ascii_mask` simultaneously strips
+ASCII encoding and zeros the garbage bytes.
+
+Returns `(; ascii_mask, alpha_mask, steps)`. Each step has `(; multiplier, shift)`
+and optionally `mask` (omitted on the final step). The multiply-shift reduction
+combines adjacent digit groups in O(log n) steps:
+
+    # intermediate step:  word = ((word * multiplier) >> shift) & mask
+    # final step:         word = (word * multiplier) >> shift
+
+The multiplier `Cₖ = base^g * 2^(g*8) + 1` encodes both the scale factor and the
+group combination into a single multiply: for each pair of `g`-byte groups
+`[even, odd]` in the word, `(even + odd * 2^(g*8)) * Cₖ` places `even * base^g + odd`
+at bit offset `g*8` within each `2g`-byte lane. The right shift then extracts it.
+
+For base > 10, an alpha correction converts hex letter bytes to values 10-15
+between the ASCII mask and the first reduction step.
+"""
+function swarparse_consts(::Type{T}, base::Int, nd::Int) where {T <: Unsigned}
+    nbytes = sizeof(T)
+    1 <= nd <= nbytes || throw(ArgumentError(
+        "ndigits=$nd must be between 1 and $nbytes for $T"))
+    2 <= base <= 16 || throw(ArgumentError(
+        "base=$base must be between 2 and 16"))
+    hex = base > 10
+    padding = nbytes - nd
+    # Digit bytes sit in the high positions (byte indices padding:nbytes-1).
+    # ASCII mask: 0x0F (or 0x4F for hex) per digit byte, 0x00 per garbage byte.
+    byteval = hex ? T(0x4F) : T(0x0F)
+    ascii_mask = reduce(|, (byteval << (8 * (padding + i)) for i in 0:nd-1); init=zero(T))
+    alpha_mask = if hex
+        reduce(|, (T(0x40) << (8 * (padding + i)) for i in 0:nd-1); init=zero(T))
+    else
+        zero(T)
+    end
+    # Reduction steps: combine adjacent digit groups in a binary tree using
+    # multiply-shift. At each level, groups of `g` bytes are paired. The multiplier
+    # Cₖ = base^g * 2^(g*8) + 1 computes `even * base^g + odd` for each pair via a
+    # single multiply, and the right shift extracts the combined value. An AND mask
+    # between steps cleans up inter-lane overflow; the final step omits it since the
+    # result is extracted by truncation or a single shift.
+    nsteps = nd <= 1 ? 0 : 8 * sizeof(nd) - leading_zeros(nd - 1)
+    steps = map(1:nsteps) do step
+        g = 1 << (step - 1)      # current group size in bytes
+        shift = g * 8
+        scale = T(base) ^ g
+        multiplier = scale * (one(T) << shift) + one(T)
+        if step < nsteps
+            # Cleanup mask: g bytes of 0xFF alternating with g bytes of 0x00,
+            # shifted up by g bytes (the result sits in the high half of each pair)
+            group_mask = (one(T) << shift) - one(T)
+            mask = reduce(|, (group_mask << (2g * 8 * i) for i in 0:(nbytes ÷ (2g))); init=zero(T))
+            (; multiplier, shift, mask)
+        else
+            (; multiplier, shift)
+        end
+    end
+    (; ascii_mask, alpha_mask, steps = Tuple(steps))
+end
+
+"""
+    swar_digitconsts(::Type{T}, base::Int)
+
+Compute constants for SWAR digit detection in type `T` for the given `base`.
+Returns a named tuple used by `gen_swar_digitcheck` and `gen_swar_digitcount`.
+
+For base ≤ 10, uses the nibble-check approach:
+    diff = (val & (val + addmask) & 0xF0F0...) ⊻ 0x3030...
+where `diff` is zero per-byte for valid digits.
+
+For base 11-16 (hex), uses addition-based range checks after casefolding:
+    nondigit = (is_decimal | is_alpha) ⊻ 0x8080...
+where `nondigit` has bit 7 set per-byte for non-digits. Cross-byte carry
+from invalid bytes cannot produce false positives because we scan/check
+from the lowest byte, so corruption is always beyond the first failure.
+"""
+function swar_digitconsts(::Type{T}, base::Int) where {T <: Unsigned}
+    rep = T(0x01) * typemax(T) ÷ typemax(UInt8)  # 0x0101... repeating byte
+    if base <= 10
+        addmask = T(0x10 - base) * rep
+        nibmask = T(0xF0) * rep
+        expected = T(0x30) * rep
+        (; kind = :nibble, addmask, nibmask, expected)
+    else
+        foldmask = T(0x20) * rep
+        hibits = T(0x80) * rep
+        # Decimal range 0x30-0x39
+        dec_lo = T(0x80 - 0x30) * rep   # 0x50
+        dec_hi = T(0x80 - 0x3A) * rep   # 0x46
+        # Alpha range 0x61-(0x60+base-10) (after casefold), i.e. a-f for base 16
+        alp_end = 0x61 + base - 10  # one past last valid alpha digit
+        alp_lo = T(0x80 - 0x61) * rep
+        alp_hi = T(0x80 - alp_end) * rep
+        (; kind = :hex, foldmask, hibits, dec_lo, dec_hi, alp_lo, alp_hi)
+    end
+end
+
+"""
+    gen_swar_nondigits(::Type{T}, var::Symbol, result::Symbol, base::Int) -> Expr
+
+Generate an expression that computes a non-digit indicator from `var::T` into
+`result::T`. For base ≤ 10, each byte of `result` is zero for valid digits and
+nonzero otherwise. For base > 10, bit 7 of each byte in `result` is set for
+non-digits, clear for digits.
+"""
+function gen_swar_nondigits(::Type{T}, var::Symbol, result::Symbol, base::Int) where {T <: Unsigned}
+    c = swar_digitconsts(T, base)
+    if c.kind === :nibble
+        :($(result) = ($var & ($var + $(c.addmask)) & $(c.nibmask)) ⊻ $(c.expected))
+    else
+        dec_ok = gensym("dec")
+        alp_ok = gensym("alp")
+        folded = gensym("folded")
+        # Decimal check uses the original value (0-9 are unaffected by casefold,
+        # and casefolding would turn control chars like 0x10 into 0x30).
+        # Alpha check uses the casefolded value (A-F → a-f).
+        quote
+            $folded = $var | $(c.foldmask)
+            $dec_ok = ($var + $(c.dec_lo)) & ~($var + $(c.dec_hi)) & $(c.hibits)
+            $alp_ok = ($folded + $(c.alp_lo)) & ~($folded + $(c.alp_hi)) & $(c.hibits)
+            $result = ($dec_ok | $alp_ok) ⊻ $(c.hibits)
+        end
+    end
+end
+
+"""
+    gen_swar_digitcheck(::Type{T}, var::Symbol, base::Int, nd::Int, on_fail) -> Vector{ExprVarLine}
+
+Generate expressions that check all `nd` high-aligned digit bytes in `var::T`
+are valid base-`base` digits. If the check fails, evaluates `on_fail`.
+"""
+function gen_swar_digitcheck(::Type{T}, var::Symbol, base::Int, nd::Int, on_fail) where {T <: Unsigned}
+    nondig = gensym("nondig")
+    check_expr = gen_swar_nondigits(T, var, nondig, base)
+    padding = sizeof(T) - nd
+    checkmask = if base <= 10
+        # Nibble check: diff is zero for digit bytes, nonzero otherwise.
+        # Mask to only check the nd high-aligned digit bytes.
+        padding == 0 ? nothing : typemax(T) - ((one(T) << (8 * padding)) - one(T))
+    else
+        # Hex check: bit 7 set per non-digit byte.
+        # Mask high bits of the nd digit bytes only.
+        rep = T(0x80) * (T(0x01) * typemax(T) ÷ typemax(UInt8))
+        padding == 0 ? nothing : rep & (typemax(T) - ((one(T) << (8 * padding)) - one(T)))
+    end
+    # When nd == sizeof(T), the mask covers all bytes — omit the redundant AND
+    failcond = isnothing(checkmask) ? :(!iszero($nondig)) : :(!iszero($nondig & $checkmask))
+    ExprVarLine[check_expr, :(if $failcond; $on_fail end)]
+end
+
+"""
+    gen_swar_digitcount(::Type{T}, var::Symbol, countvar::Symbol, base::Int, maxdigits::Int) -> Vector{ExprVarLine}
+
+Generate expressions that count consecutive base-`base` digit bytes from the
+LSB of `var::T`, storing the count in `countvar`. Counts at most `maxdigits`.
+Digits are in the low byte positions (not high-aligned).
+"""
+function gen_swar_digitcount(::Type{T}, var::Symbol, countvar::Symbol, base::Int, maxdigits::Int) where {T <: Unsigned}
+    nondig = gensym("nondig")
+    check_expr = gen_swar_nondigits(T, var, nondig, base)
+    # Set sentinel bits beyond maxdigits to ensure we stop counting
+    sentinel_expr = if maxdigits < sizeof(T)
+        sentinel = ~((one(T) << (8 * maxdigits)) - one(T))
+        if base <= 10
+            # For nibble check, any nonzero byte stops the count.
+            # Set all bits beyond maxdigits.
+            :($nondig |= $sentinel)
+        else
+            # For hex check, only bit 7 matters. Set bit 7 beyond maxdigits.
+            hibits = T(0x80) * (T(0x01) * typemax(T) ÷ typemax(UInt8))
+            :($nondig |= $(sentinel & hibits))
+        end
+    else
+        nothing
+    end
+    count_assign = if base <= 10
+        # Nibble check: each non-digit byte is nonzero, digit byte is zero.
+        # haszero: sets bit 7 for each ZERO byte (i.e. digit byte), invert to find first non-digit.
+        rep01 = T(0x01) * typemax(T) ÷ typemax(UInt8)
+        rep80 = T(0x80) * rep01
+        :($countvar = trailing_zeros(
+            (($nondig - $rep01) & ~$nondig & $rep80) ⊻ $rep80) >> 3)
+    else
+        # Hex check: bit 7 set for non-digits. First set bit 7 = first non-digit.
+        :($countvar = trailing_zeros($nondig) >> 3)
+    end
+    result = ExprVarLine[check_expr]
+    isnothing(sentinel_expr) || push!(result, sentinel_expr)
+    push!(result, count_assign)
+    result
+end
+
+"""
+    gen_swarparse(::Type{T}, var::Symbol, base::Int, nd::Int) -> Vector{ExprVarLine}
+
+Generate expressions that SWAR-parse `nd` fixed-width ASCII digit bytes
+(base ≤ 16) from `var::T`, storing the result back in `var`.
+
+The caller is responsible for loading `sizeof(T)` bytes ending at the last
+digit into `var` before this expression runs. The `ascii_mask` zeros any
+garbage bytes in the low positions.
+
+Uses the multiply-shift reduction: each step applies `var = ((var * Cₖ) >> shift) & mask`,
+where `Cₖ = base^g * 2^(g*8) + 1`. The final step omits the mask (result extracted
+by the shift alone). This is 2-3 ops per step vs the 5-op mask-multiply-shift-add-mask
+of the textbook SWAR approach.
+"""
+function gen_swarparse(::Type{T}, var::Symbol, base::Int, nd::Int) where {T <: Unsigned}
+    c = swarparse_consts(T, base, nd)
+    exprs = ExprVarLine[:($var &= $(c.ascii_mask))]
+    if !iszero(c.alpha_mask)
+        alpha = gensym("alpha")
+        push!(exprs,
+              :($alpha = $var & $(c.alpha_mask)),
+              :($var = ($alpha >> 6) * $(T(9)) + ($var ⊻ $alpha)))
+    end
+    for s in c.steps
+        if hasproperty(s, :mask)
+            push!(exprs,
+                  :($var = (($var * $(s.multiplier)) >> $(s.shift)) & $(s.mask)))
+        else
+            push!(exprs,
+                  :($var = ($var * $(s.multiplier)) >> $(s.shift)))
+        end
+    end
+    exprs
+end
+
+"""
+    gen_swar_load(::Type{T}, var::Symbol, nd::Int; backward::Bool) -> Expr
+
+Generate an expression that loads `nd` digit bytes from `idbytes` at `pos` into
+`var::T`, high-aligned (digit bytes in the most significant positions, low bytes
+zeroed).
+
+When `backward=true` and `nd < sizeof(T)`, loads `sizeof(T)` bytes ending at the
+last digit byte (`pos + nd - 1`), relying on preceding parsed bytes as padding.
+This is a single load — the cheapest path.
+
+When `backward=false` and `nd == sizeof(T)`, loads `sizeof(T)` bytes starting at `pos`
+(no padding needed, digits already fill the entire register).
+
+When `backward=false` and `nd < sizeof(T)`, performs an **exact load**: decomposes `nd`
+into power-of-2 sub-loads (e.g., 3 = 2+1, 5 = 4+1, 7 = 4+2+1), each shifted to its
+high-aligned position and ORed together. This reads exactly `nd` bytes, avoiding any
+out-of-bounds access and eliminating the need for forward-safety length checks.
+
+Uses `htol` for endianness portability on multi-byte loads.
+"""
+function gen_swar_load(::Type{T}, var::Symbol, nd::Int; backward::Bool) where {T}
+    if nd == sizeof(T)
+        # Full-width load — no padding, no alignment needed
+        if T === UInt8
+            return :($var = @inbounds idbytes[pos])
+        end
+        return :($var = htol(Base.unsafe_load(Ptr{$T}(pointer(idbytes, pos)))))
+    end
+    # nd < sizeof(T): need high-alignment
+    if backward
+        # Single load reading sizeof(T) bytes ending at the last digit byte
+        padding = sizeof(T) - nd
+        return :($var = htol(Base.unsafe_load(Ptr{$T}(pointer(idbytes, pos - $padding)))))
+    end
+    # Exact load: decompose nd into power-of-2 chunks, then shift each to its
+    # correct byte position and OR together. On little-endian, a chunk loaded at
+    # string offset `off` should occupy byte positions `padding+off` through
+    # `padding+off+chunk-1` in the register (byte 0 = LSB), so the bit shift
+    # is `8 * (padding + off)`.
+    padding = sizeof(T) - nd
+    chunks = Tuple{Int,Int}[]  # (chunk_size_bytes, string_offset_from_pos)
+    remaining = nd
+    offset = 0
+    while remaining > 0
+        chunk = 1 << (8 * sizeof(remaining) - 1 - leading_zeros(remaining))
+        push!(chunks, (chunk, offset))
+        offset += chunk
+        remaining -= chunk
+    end
+    parts = Expr[]
+    for (chunk, off) in chunks
+        bit_shift = 8 * (padding + off)
+        cT = swar_type(chunk)
+        load = if cT === UInt8
+            :($T(@inbounds idbytes[pos + $off]))
+        else
+            :(htol(Base.unsafe_load(Ptr{$cT}(pointer(idbytes, pos + $off)))) % $T)
+        end
+        push!(parts, bit_shift == 0 ? load : :($load << $bit_shift))
+    end
+    rhs = parts[1]
+    for i in 2:length(parts)
+        rhs = :($rhs | $(parts[i]))
+    end
+    :($var = $rhs)
+end
+
+"""
+    gen_swar_varload(::Type{sT}, var, countvar, availvar, base, maxdigits) -> Vector{ExprVarLine}
+
+Generate a cascading variable-width load for SWAR digit parsing. Decomposes
+`maxdigits` into descending power-of-2 chunks and generates a flat sequence of
+conditional load-check-accumulate blocks.
+
+After execution, `var::sT` holds the digit bytes low-aligned (first digit at
+LSB) and `countvar` holds the number of consecutive digit bytes found (0 to
+maxdigits). The caller must left-shift to high-align before running `gen_swarparse`.
+
+The generated code references `idbytes`, `pos` (from the enclosing parse
+context), and `availvar` (max bytes available, set by the caller via
+`defid_lengthbound`).
+
+Each chunk reads exactly `chunk` bytes, so no oversized loads occur and no
+`__length_check` for `sizeof(sT)` is needed — eliminating the `parseint` fallback.
+"""
+function gen_swar_varload(::Type{sT}, var::Symbol, countvar::Symbol,
+                          availvar::Symbol, base::Int, maxdigits::Int) where {sT <: Unsigned}
+    @assert sizeof(sT) >= maxdigits "gen_swar_varload requires sizeof(sT) >= maxdigits"
+    # Enumerate all power-of-2 chunk sizes from prevpow2(maxdigits) down to 1.
+    # Each chunk is tried at the current offset: if all its bytes are digits it
+    # advances the count, otherwise we fall through to the next smaller chunk.
+    # This covers all possible digit counts 0..maxdigits.
+    chunks = Int[]
+    c = 1 << (8 * sizeof(maxdigits) - 1 - leading_zeros(maxdigits))
+    while c >= 1
+        push!(chunks, c)
+        c >>= 1
+    end
+    gen_varload_chunks(sT, var, countvar, availvar, base, maxdigits, chunks)
+end
+
+"""Generate the cascading load-check-accumulate blocks for the given chunk sequence."""
+function gen_varload_chunks(::Type{sT}, var::Symbol, countvar::Symbol,
+                            availvar::Symbol, base::Int, maxdigits::Int,
+                            chunks::AbstractVector{Int}) where {sT <: Unsigned}
+    isempty(chunks) && return ExprVarLine[]
+    chunk = first(chunks)
+    rest = @view chunks[2:end]
+    cT = swar_type(chunk)
+    chunk_var = gensym("chunk$(chunk)")
+    nondig_var = gensym("nondig$(chunk)")
+    load_expr = if cT === UInt8
+        :($chunk_var = @inbounds idbytes[pos + $countvar])
+    else
+        :($chunk_var = htol(Base.unsafe_load(Ptr{$cT}(pointer(idbytes, pos + $countvar)))))
+    end
+    nondig_raw = gen_swar_nondigits(cT, chunk_var, nondig_var, base)
+    nondig_stmts = if Meta.isexpr(nondig_raw, :block)
+        filter(e -> !(e isa LineNumberNode), nondig_raw.args)
+    else
+        ExprVarLine[nondig_raw]
+    end
+    accum = :($var |= ($chunk_var % $sT) << ($countvar << 3))
+    advance = :($countvar += $chunk)
+    # When this chunk fills the register, a successful load-and-check accounts
+    # for all maxdigits bytes. Remaining smaller chunks only run on failure,
+    # nested under else branches to skip redundant checks.
+    rest_exprs = gen_varload_chunks(sT, var, countvar, availvar, base, maxdigits, rest)
+    if chunk == sizeof(sT)
+        # Full-register chunk: success means done, smaller chunks under else.
+        # Both the bounds failure and the digit-check failure fall through to
+        # the same smaller-chunk cascade since countvar hasn't advanced.
+        ExprVarLine[:(if $countvar + $chunk <= $availvar
+                          $load_expr
+                          $(nondig_stmts...)
+                          if iszero($nondig_var)
+                              $accum
+                              $advance
+                          else
+                              $(rest_exprs...)
+                          end
+                      else
+                          $(rest_exprs...)
+                      end)]
+    else
+        # Sub-register chunk: independent check, then continue to next chunk
+        ExprVarLine[:(if $countvar + $chunk <= $availvar
+                          $load_expr
+                          $(nondig_stmts...)
+                          if iszero($nondig_var)
+                              $accum
+                              $advance
+                          end
+                      end),
+                    rest_exprs...]
+    end
+end
+
+"""
+    compute_digit_vocab(fieldvar, option, dspec, ctx) -> NamedTuple
+
+Compute the shared vocabulary needed by all digit-parse strategies and wrapping
+helpers. Bundles symbols, encoding expressions, range checks, and error messages.
+"""
+function compute_digit_vocab(fieldvar::Symbol, option,
+                             dspec::NamedTuple,
+                             ctx::Base.ImmutableDict{Symbol, Any})
+    (; base, mindigits, maxdigits, min, max, pad, dI, dT) = dspec
+    fixedwidth = mindigits == maxdigits
+    fnum = Symbol("$(fieldvar)_num")
+    # numexpr: transform raw fnum into the stored representation
+    directval = cardbits(max - min + 1 + !isnothing(option)) ==
+                cardbits(max) && (min > 0 || isnothing(option))
+    numexpr = if directval
+        if dI != dT; :($fnum % $dT) else fnum end
+    elseif iszero(min) && !isnothing(option)
+        :($fnum + $(one(dT)))
+    elseif min - !isnothing(option) > 0
+        :(($fnum - $(dT(min - !isnothing(option)))) % $dT)
+    else
+        if dI != dT; :($fnum % $dT) else fnum end
+    end
+    directvar = numexpr === fnum
+    parsevar = ifelse(directvar, fnum, fieldvar)
+    rangecheck = if min == 0 && max == base^maxdigits - 1
+        :()
+    else
+        maxerr = defid_errmsg(ctx, "Expected at most a value of $(string(max; base, pad))")
+        minerr = defid_errmsg(ctx, "Expected at least a value of $(string(min; base, pad))")
+        maxcheck = :($fnum <= $max || return ($maxerr, pos))
+        mincheck = :($fnum >= $min || return ($minerr, pos))
+        if min == 0; maxcheck
+        elseif max == base^maxdigits - 1; mincheck
+        else :($mincheck; $maxcheck) end
+    end
+    errmsg = defid_errmsg(ctx, if fixedwidth && maxdigits > 1
+        "exactly $maxdigits digits in base $base"
+    elseif mindigits > 1
+        "$mindigits to $maxdigits digits in base $base"
+    else
+        "up to $maxdigits digits in base $base"
+    end)
+    fail_expr = :(return ($errmsg, pos))
+    (; fnum, fieldvar, parsevar, directvar, numexpr, rangecheck,
+       fail_expr, option, dT, errmsg)
+end
+
+"""
+    digit_required(vocab, fnum_setters...) -> Vector{ExprVarLine}
+
+Wrap fnum-producing expressions with range checking and encoding for required fields.
+"""
+function digit_required(vocab, fnum_setters...)
+    (; rangecheck, directvar, fieldvar, numexpr) = vocab
+    exprs = ExprVarLine[]
+    for s in fnum_setters
+        s isa Vector ? append!(exprs, s) : push!(exprs, s)
+    end
+    rangecheck != :() && push!(exprs, rangecheck)
+    directvar || push!(exprs, :($fieldvar = $numexpr))
+    exprs
+end
+
+"""
+    digit_optional(vocab, valid_cond, fnum_setters) -> Vector{ExprVarLine}
+
+Wrap fnum-producing expressions with range checking and encoding for optional fields.
+Returns a single-element vector containing the if/else parsevar assignment.
+"""
+function digit_optional(vocab, valid_cond, fnum_setters)
+    (; parsevar, rangecheck, numexpr, option, dT) = vocab
+    ExprVarLine[:($parsevar = if $valid_cond
+                      $(fnum_setters...)
+                      $rangecheck; $numexpr
+                  else
+                      $option = false; zero($dT)
+                  end)]
+end
+
+"""
+    digit_absent(vocab) -> Vector{ExprVarLine}
+
+Emit the `option = false; parsevar = zero(dT)` pair for an absent optional field.
+"""
+function digit_absent(vocab)
+    (; option, parsevar, dT) = vocab
+    ExprVarLine[:($option = false), :($parsevar = zero($dT))]
+end
+
+"""
+    gen_swar_chunk(cT, var, nd, base, on_fail) -> (check, parse)
+
+Generate digit-checking and value-parsing expressions for a single SWAR chunk.
+Handles 1-digit decimal, 1-digit hex, and multi-digit SWAR cases.
+"""
+function gen_swar_chunk(cT, var::Symbol, nd::Int, base::Int, on_fail)
+    check = if nd == 1 && base <= 10
+        ExprVarLine[:($var = ($var - $(UInt8('0'))) % $cT),
+             :(if $var >= $(cT(base)); $on_fail end)]
+    elseif nd == 1  # hex single byte
+        folded = gensym("folded")
+        ExprVarLine[:($folded = ($var | 0x20) % $cT),
+             :($var = $folded - $(cT(0x30))),
+             :(if $var > $(cT(9))
+                   $var = $folded - $(cT(0x61 - 10))
+                   if $var < $(cT(10)) || $var >= $(cT(base))
+                       $on_fail
+                   end
+               end)]
+    else
+        gen_swar_digitcheck(cT, var, base, nd, on_fail)
+    end
+    parse = nd == 1 ? ExprVarLine[] : gen_swarparse(cT, var, base, nd)
+    (check, parse)
+end
+
+"""
+    gen_digit_parseint(vocab, dspec, ctx) -> Vector{ExprVarLine}
+
+Scalar `parseint` fallback for digit fields where SWAR isn't applicable.
+"""
+function gen_digit_parseint(vocab, dspec::NamedTuple,
+                            ctx::Base.ImmutableDict{Symbol, Any})
+    (; fnum, fail_expr, option) = vocab
+    (; base, mindigits, maxdigits) = dspec
+    fixedwidth = mindigits == maxdigits
+    bitsconsumed = Symbol("$(vocab.fieldvar)_bitsconsumed")
+    scanlimit = defid_lengthbound(ctx, maxdigits)
+    matchcond = if fixedwidth
+        :($bitsconsumed == $maxdigits)
+    elseif mindigits > 1
+        :($bitsconsumed >= $mindigits)
+    else
+        :(!iszero($bitsconsumed))
+    end
+    fnum_set = :(($bitsconsumed, $fnum) = parseint($(dspec.dI), idbytes, pos, $base, $scanlimit))
+    if isnothing(option)
+        digit_required(vocab, fnum_set, :($matchcond || $fail_expr))
+    else
+        # parseint must run before matchcond is checked
+        ExprVarLine[fnum_set, digit_optional(vocab, matchcond, ExprVarLine[])...]
+    end
+end
+
+"""
+    gen_digit_fixed_guarded(vocab, ctx, nd, load_exprs, check_fn, parse_and_encode)
+
+Shared skeleton for fixed-width digit strategies. Handles the length guard and
+required/optional branching that every fixed-width path needs.
+
+`check_fn(on_fail) -> Vector{ExprVarLine}` produces check expressions that
+evaluate `on_fail` when the digit check fails.
+"""
+function gen_digit_fixed_guarded(vocab, ctx::Base.ImmutableDict{Symbol, Any},
+                                 nd::Int,
+                                 load_exprs::Vector{ExprVarLine},
+                                 check_fn,
+                                 parse_and_encode::Vector{ExprVarLine})
+    (; fail_expr, option, errmsg) = vocab
+    bytes_before_min = ctx[:parsed_bytes_min][]
+    bytes_before_max = ctx[:parsed_bytes_max][]
+    if isnothing(option)
+        nd_guard = :(if !($(Expr(:call, :__length_check, nd, nd, nd,
+                                  bytes_before_min, bytes_before_max)))
+                         return ($errmsg, pos)
+                     end)
+        ExprVarLine[nd_guard, load_exprs..., check_fn(fail_expr)...,
+                    parse_and_encode..., digit_required(vocab)...]
+    else
+        valid = gensym("valid")
+        opt_check = Expr(:call, :__length_check, nd, nd, nd,
+                          bytes_before_min, bytes_before_max)
+        check = check_fn(:($valid = false))
+        swar_block = ExprVarLine[:($valid = true), check...,
+                                 digit_optional(vocab, :($valid), parse_and_encode)...]
+        ExprVarLine[:(if $opt_check
+                          $(load_exprs...)
+                          $(swar_block...)
+                      else
+                          $(digit_absent(vocab)...)
+                      end)]
+    end
+end
+
+"""
+    gen_digit_swar_fixed(vocab, dspec, ctx) -> Vector{ExprVarLine}
+
+Fixed-width single-chunk SWAR for 1-8 digit fields. Uses `gen_swar_chunk` for
+the digit check (which has a sub+cmp fast path for nd==1) and delegates the
+required/optional wrapping to `gen_digit_fixed_guarded`.
+
+Load strategy (best to worst):
+1. Backward — preceding bytes provide padding for a single sizeof(sT) load
+2. Forward overread — trailing content guarantees sizeof(sT) bytes at pos;
+   single full-width load + left-shift discards overflow (via `__ifelse_length_exceeds`)
+3. Exact — decompose maxdigits into power-of-2 sub-loads, shift and OR
+"""
+function gen_digit_swar_fixed(vocab, dspec::NamedTuple,
+                              ctx::Base.ImmutableDict{Symbol, Any})
+    (; fnum) = vocab
+    (; base, maxdigits, dI) = dspec
+    sT = swar_type(maxdigits)
+    swar_var = Symbol("$(vocab.fieldvar)_swar")
+    # Backward load when enough preceding bytes provide padding
+    backward = ctx[:parsed_bytes_min][] >= sizeof(sT) - maxdigits
+    # Forward overread: when maxdigits < sizeof(sT) and backward isn't available,
+    # a full-width forward load + left-shift is cheaper than exact sub-loads.
+    # Gated by __ifelse_length_exceeds so it only activates when trailing content
+    # guarantees sizeof(sT) bytes exist from pos onward.
+    use_forward_overread = !backward && maxdigits < sizeof(sT)
+    load = if use_forward_overread
+        shift = 8 * (sizeof(sT) - maxdigits)
+        wide_load = :($swar_var = htol(Base.unsafe_load(Ptr{$sT}(pointer(idbytes, pos)))) << $shift)
+        narrow_load = gen_swar_load(sT, swar_var, maxdigits; backward=false)
+        Expr(:call, :__ifelse_length_exceeds, sizeof(sT),
+             ctx[:parsed_bytes_min][], ctx[:parsed_bytes_max][],
+             wide_load, narrow_load)
+    else
+        gen_swar_load(sT, swar_var, maxdigits; backward)
+    end
+    check_fn = on_fail -> gen_swar_chunk(sT, swar_var, maxdigits, base, on_fail)[1]
+    # gen_swarparse is a no-op for nd==1 (just `&= 0x0F`), skip it
+    parse_expr = maxdigits == 1 ? ExprVarLine[] : gen_swarparse(sT, swar_var, base, maxdigits)
+    swar_cast = sT == dI ? :($fnum = $swar_var) : :($fnum = $swar_var % $dI)
+    gen_digit_fixed_guarded(vocab, ctx, maxdigits,
+                            ExprVarLine[load], check_fn,
+                            ExprVarLine[parse_expr..., swar_cast])
+end
+
+"""
+    gen_digit_twochunk(vocab, dspec, ctx) -> Vector{ExprVarLine}
+
+Two-chunk SWAR for fixed-width fields with 9-16 digits: split into an 8-digit
+upper chunk and a (maxdigits-8)-digit lower chunk.
+"""
+function gen_digit_twochunk(vocab, dspec::NamedTuple,
+                            ctx::Base.ImmutableDict{Symbol, Any})
+    (; fnum, fieldvar) = vocab
+    (; base, maxdigits, dI) = dspec
+    upper_nd = sizeof(UInt)  # 8
+    lower_nd = maxdigits - upper_nd
+    upper_sT = UInt64
+    lower_sT = swar_type(lower_nd)
+    # Upper chunk: full UInt64 at pos
+    upper_var = Symbol("$(fieldvar)_upper")
+    upper_load = gen_swar_load(upper_sT, upper_var, upper_nd; backward=false)
+    # Lower chunk: at pos+upper_nd (upper bytes provide backward padding)
+    lower_var = Symbol("$(fieldvar)_lower")
+    lower_backward = sizeof(lower_sT) > lower_nd
+    lower_pos_advance = :(pos += $upper_nd)
+    lower_pos_restore = :(pos -= $upper_nd)
+    lower_load = gen_swar_load(lower_sT, lower_var, lower_nd; backward=lower_backward)
+    load_exprs = ExprVarLine[upper_load, lower_pos_advance, lower_load, lower_pos_restore]
+    # Check both chunks; parse and combine: fnum = upper * base^lower_nd + lower
+    check_fn = on_fail -> begin
+        uc, _ = gen_swar_chunk(upper_sT, upper_var, upper_nd, base, on_fail)
+        lc, _ = gen_swar_chunk(lower_sT, lower_var, lower_nd, base, on_fail)
+        ExprVarLine[uc..., lc...]
+    end
+    _, upper_parse = gen_swar_chunk(upper_sT, upper_var, upper_nd, base, nothing)
+    _, lower_parse = gen_swar_chunk(lower_sT, lower_var, lower_nd, base, nothing)
+    scale = UInt64(base) ^ lower_nd
+    combine = :($fnum = ($(upper_var) * $scale + $(lower_var) % UInt64) % $dI)
+    gen_digit_fixed_guarded(vocab, ctx, maxdigits, load_exprs, check_fn,
+                            ExprVarLine[upper_parse..., lower_parse..., combine])
+end
+
+"""
+    gen_digit_swar_variable(vocab, dspec, ctx) -> Vector{ExprVarLine}
+
+Variable-width SWAR for 2-8 digit fields.
+
+Load strategy (best to worst):
+1. Backward — preceding bytes provide padding for a single sizeof(sT) backward load
+   with runtime-variable position. Digit counting from LSB after right-shift low-alignment.
+2. Forward overread — trailing content guarantees sizeof(sT) bytes at pos; single
+   full-width forward load, digit counting from LSB (digits naturally at LSB on LE),
+   left-shift to high-align. Via `__ifelse_length_exceeds`.
+3. Cascading exact-loads — decompose maxdigits into power-of-2 sub-loads (`gen_swar_varload`)
+
+When `avail` or shifts resolve to compile-time constants, LLVM eliminates
+the runtime-dependent operations entirely.
+"""
+function gen_digit_swar_variable(vocab, dspec::NamedTuple,
+                                 ctx::Base.ImmutableDict{Symbol, Any})
+    (; fnum, fail_expr, option, fieldvar) = vocab
+    (; base, mindigits, maxdigits, dI) = dspec
+    sT = swar_type(Base.min(maxdigits, sizeof(UInt)))
+    swar_var = Symbol("$(fieldvar)_swar")
+    bitsconsumed = Symbol("$(fieldvar)_bitsconsumed")
+    parse_expr = gen_swarparse(sT, swar_var, base, maxdigits)
+    countvar = Symbol("$(fieldvar)_count")
+    countcheck = mindigits > 1 ? :($countvar >= $mindigits) : :(!iszero($countvar))
+    swar_cast_var = sT == dI ? swar_var : :($swar_var % $dI)
+    varparse = ExprVarLine[
+        :($swar_var <<= ($(sizeof(sT)) - $countvar) << 3),
+        parse_expr...,
+        :($fnum = $swar_cast_var)]
+    # Backward-load: single load with runtime-variable position, branchless digit count.
+    # Requires sizeof(sT) - 1 preceding bytes (worst case: avail=1, load reaches back
+    # sizeof(sT) - 1 bytes). Most identifiers with a literal prefix qualify.
+    backward = ctx[:parsed_bytes_min][] >= sizeof(sT) - 1
+    availvar = Symbol("$(fieldvar)_avail")
+    avail_bound = defid_lengthbound(ctx, maxdigits)
+    load_and_count = if backward
+        # Load sizeof(sT) bytes ending at pos + avail - 1, then right-shift to
+        # low-align the digit window. gen_swar_digitcount counts from the LSB.
+        backload = ExprVarLine[
+            :($swar_var = htol(Base.unsafe_load(
+                Ptr{$sT}(pointer(idbytes, pos + $availvar - $(sizeof(sT))))))),
+            :($swar_var >>>= ($(sizeof(sT)) - $availvar) << 3),
+            gen_swar_digitcount(sT, swar_var, countvar, base, maxdigits)...]
+        bytes_before_min = ctx[:parsed_bytes_min][]
+        bytes_before_max = ctx[:parsed_bytes_max][]
+        # Guard avail >= mindigits (required) or avail >= 1 (optional) via
+        # __length_check, giving resolve_length_checks! a chance to fold it away.
+        guard_n = Base.max(mindigits, 1)
+        guard_check = Expr(:call, :__length_check, guard_n, guard_n, guard_n,
+                           bytes_before_min, bytes_before_max)
+        if isnothing(option)
+            ExprVarLine[:($availvar = $avail_bound),
+                        :(if !($guard_check); return ($(vocab.errmsg), pos) end),
+                        backload...]
+        else
+            ExprVarLine[:($availvar = $avail_bound),
+                        :(if $guard_check
+                              $(backload...)
+                          else
+                              $countvar = 0; $swar_var = zero($sT)
+                          end)]
+        end
+    else
+        # Forward overread: single full-width forward load at pos. Digits land at LSB
+        # (on LE with htol), so gen_swar_digitcount counts from LSB directly.
+        # The sentinel-capped maxdigits in digitcount handles overflow bytes from
+        # trailing content. Gated by __ifelse_length_exceeds for trailing safety.
+        fwdload = ExprVarLine[
+            :($swar_var = htol(Base.unsafe_load(Ptr{$sT}(pointer(idbytes, pos))))),
+            gen_swar_digitcount(sT, swar_var, countvar, base, maxdigits)...]
+        bytes_before_min = ctx[:parsed_bytes_min][]
+        bytes_before_max = ctx[:parsed_bytes_max][]
+        guard_n = Base.max(mindigits, 1)
+        guard_check = Expr(:call, :__length_check, guard_n, guard_n, guard_n,
+                           bytes_before_min, bytes_before_max)
+        fwd_guarded = if isnothing(option)
+            ExprVarLine[:(if !($guard_check); return ($(vocab.errmsg), pos) end),
+                        fwdload...]
+        else
+            ExprVarLine[:(if $guard_check
+                              $(fwdload...)
+                          else
+                              $countvar = 0; $swar_var = zero($sT)
+                          end)]
+        end
+        # Cascading power-of-2 exact-loads fallback (no backward or forward safety)
+        varload = gen_swar_varload(sT, swar_var, countvar, availvar, base, maxdigits)
+        cascade = ExprVarLine[:($countvar = 0), :($swar_var = zero($sT)),
+                              :($availvar = $avail_bound), varload...]
+        # Emit both paths; __ifelse_length_exceeds selects at resolution time
+        wide = Expr(:block, fwd_guarded...)
+        narrow = Expr(:block, cascade...)
+        ExprVarLine[Expr(:call, :__ifelse_length_exceeds, sizeof(sT),
+                         bytes_before_min, bytes_before_max,
+                         wide, narrow)]
+    end
+    if isnothing(option)
+        swar_core = ExprVarLine[load_and_count...,
+                                :($countcheck || $fail_expr),
+                                varparse...,
+                                :($bitsconsumed = $countvar)]
+        append!(swar_core, digit_required(vocab))
+        swar_core
+    else
+        ExprVarLine[load_and_count...,
+                    :($bitsconsumed = $countvar),
+                    digit_optional(vocab, countcheck, varparse)...]
+    end
+end
+
+"""
+    gen_digit_parse(ctx, fieldvar, option, dspec) -> (; exprs, parsevar, directvar)
+
+Generate parse expressions for a digit field, using SWAR when applicable.
+
+Returns the expressions to append to the parse vector, plus `parsevar` (the
+symbol holding the encoded value for `defid_orshift`) and `directvar` (whether
+`parsevar === fnum`, controlling print/property extraction).
+
+`dspec` is a NamedTuple with: `base`, `mindigits`, `maxdigits`, `min`, `max`,
+`pad`, `dI` (value integer type), `dT` (stored/encoded type).
+"""
+function gen_digit_parse(ctx::Base.ImmutableDict{Symbol, Any},
+                         fieldvar::Symbol, option,
+                         dspec::NamedTuple)
+    vocab = compute_digit_vocab(fieldvar, option, dspec, ctx)
+    (; mindigits, maxdigits, base) = dspec
+    fixedwidth = mindigits == maxdigits
+    swar_limit = fixedwidth ? 2 * sizeof(UInt) : sizeof(UInt)
+    use_swar = base <= 16 && maxdigits <= swar_limit
+    exprs = if !use_swar
+        gen_digit_parseint(vocab, dspec, ctx)
+    elseif !fixedwidth
+        gen_digit_swar_variable(vocab, dspec, ctx)
+    elseif maxdigits > sizeof(UInt)
+        gen_digit_twochunk(vocab, dspec, ctx)
+    else
+        gen_digit_swar_fixed(vocab, dspec, ctx)
+    end
+    (; exprs, vocab.parsevar, vocab.directvar)
+end
+
 function defid_digits!(exprs::IdExprs,
                        ctx::Base.ImmutableDict{Symbol, Any},
                        args::Vector{Any})
@@ -950,75 +1855,30 @@ function defid_digits!(exprs::IdExprs,
     directval = cardbits(range) == cardbits(max) && (min > 0 || isnothing(option))
     dbits = sizeof(typeof(range)) * 8 - leading_zeros(range)
     dI = cardtype(8 * sizeof(typeof(max)) - leading_zeros(max))
+    dT = cardtype(dbits)
     fieldvar = get(ctx, :fieldvar, gensym("digits"))
-    bitsconsumed = Symbol("$(fieldvar)_bitsconsumed")
-    matchcond = if fixedwidth
-        :($bitsconsumed == $maxdigits)
-    elseif mindigits > 1
-        :($bitsconsumed >= $mindigits)
-    else
-        :(!iszero($bitsconsumed))
-    end
     nbits = (ctx[:bits][] += dbits)
     fixedpad = ifelse(fixedwidth, maxdigits, 0)
     printmin = Base.max(ndigits(Base.max(min, 1); base), pad, fixedpad)
     printmax = Base.max(ndigits(max; base), pad, fixedpad)
-    scanlimit = defid_lengthbound(ctx, maxdigits)
+    # gen_digit_parse reads ctx[:parsed_bytes_*] for SWAR safety, so call before updating
+    dspec = (; base, mindigits, maxdigits, min, max, pad, dI, dT)
+    parsed = gen_digit_parse(ctx, fieldvar, option, dspec)
     ctx[:print_bytes_min][] += printmin
     ctx[:print_bytes_max][] += printmax
     ctx[:parsed_bytes_min][] += mindigits
     ctx[:parsed_bytes_max][] += maxdigits
     fnum = Symbol("$(fieldvar)_num")
-    dT = cardtype(dbits)
-    numexpr = if directval
-        if dI != dT; :($fnum % $dT) else fnum end
-    elseif iszero(min) && !isnothing(option)
-        :($fnum + $(one(dT)))
-    elseif min - !isnothing(option) > 0
-        :(($fnum - $(dT(min - !isnothing(option)))) % $dT)
+    bitsconsumed = Symbol("$(fieldvar)_bitsconsumed")
+    (; parsevar, directvar) = parsed
+    append!(exprs.parse, parsed.exprs)
+    posadv = ifelse(fixedwidth, maxdigits, bitsconsumed)
+    posexpr = if isnothing(option)
+        :(pos += $posadv)
     else
-        if dI != dT; :($fnum % $dT) else fnum end
+        :(if $option; pos += $posadv end)
     end
-    rangecheck = if min == 0 && max == base^maxdigits - 1
-        :()
-    else
-        maxerr = defid_errmsg(ctx, "Expected at most a value of $(string(max; base, pad))")
-        minerr = defid_errmsg(ctx, "Expected at least a value of $(string(min; base, pad))")
-        maxcheck = :($fnum <= $max || return ($maxerr, pos))
-        mincheck = :($fnum >= $min || return ($minerr, pos))
-        if min == 0; maxcheck
-        elseif max == base^maxdigits - 1; mincheck
-        else :($mincheck; $maxcheck) end
-    end
-    errmsg = defid_errmsg(ctx, if fixedwidth && maxdigits > 1
-        "exactly $maxdigits digits in base $base"
-    elseif mindigits > 1
-        "$mindigits to $maxdigits digits in base $base"
-    else
-        "up to $maxdigits digits in base $base"
-    end)
-    directvar = numexpr === fnum
-    parsevar = ifelse(directvar, fnum, fieldvar)
-    push!(exprs.parse,
-          :(($bitsconsumed, $fnum) = parseint($dI, idbytes, pos, $base, $scanlimit)))
-    if isnothing(option)
-        push!(exprs.parse, :($matchcond || return ($errmsg, pos)))
-        rangecheck != :() && push!(exprs.parse, rangecheck)
-        directvar || push!(exprs.parse, :($fieldvar = $numexpr))
-    else
-        push!(exprs.parse,
-              :($parsevar = if $matchcond
-                    $option = true
-                    $rangecheck
-                    $numexpr
-                else
-                    $option = false
-                    zero($dT)
-                end))
-    end
-    push!(exprs.parse,
-          defid_orshift(ctx, dT, parsevar, nbits),
-          :(pos += $(fixedwidth ? maxdigits : bitsconsumed)))
+    push!(exprs.parse, defid_orshift(ctx, dT, parsevar, nbits), posexpr)
     # --- Extract and print ---
     fextract = :($fnum = $(defid_fextract(ctx, nbits, dbits)))
     fcast = dI == dT ? fnum : :($fnum % $dI)
@@ -1157,16 +2017,8 @@ function defid_charseq!(exprs::IdExprs,
         [:($option = false), :($charvar = zero($cT)), :($lenvar = 0)]
     end
     if !isnothing(option) && variable && minlen == 0
-        push!(exprs.parse,
-              :(if $lenvar > 0
-                    $option = true
-                elseif !@isdefined($option)
-                    $option = false
-                end))
+        push!(exprs.parse, :($lenvar > 0 || ($option = false)))
     else
-        if !isnothing(option)
-            push!(exprs.parse, :($option = true))
-        end
         push!(exprs.parse,
               :(if $(if variable; :($lenvar < $minlen) else :($lenvar != $maxlen) end)
                     $(notfound...)
@@ -1296,6 +2148,18 @@ function resolve_length_checks!(exprlikes::Vector{<:ExprVarLine}, total_parsed_m
     splice_indices = Int[]
     for (idx, expr) in enumerate(exprlikes)
         expr isa Expr || continue
+        # Handle top-level sentinels that aren't nested inside another expr
+        if Meta.isexpr(expr, :call) && first(expr.args) === :__ifelse_length_exceeds
+            n_required, _, parsed_max, wide_branch, narrow_branch = expr.args[2:end]
+            elided = true
+            taken = total_parsed_min - parsed_max >= n_required ? wide_branch : narrow_branch
+            if taken isa Expr
+                result, elided = resolve_length_check_expr!(taken, total_parsed_min, elided)
+                !isnothing(result) && result !== :remove && (taken = result)
+            end
+            exprlikes[idx] = taken
+            continue
+        end
         result, elided = resolve_length_check_expr!(expr, total_parsed_min, elided)
         if result === :remove
             push!(splice_indices, idx)
@@ -1378,6 +2242,16 @@ function resolve_length_check_expr!(expr::Expr, total::Int, elided::Bool)
                 replacement = :(min($n, nbytes - pos + 1))
                 arg.head, arg.args = replacement.head, replacement.args
             end
+        elseif Meta.isexpr(arg, :call) && first(arg.args) === :__ifelse_length_exceeds
+            # Purely compile-time: replace with the satisfied or fallback branch
+            n_required, _, parsed_max, wide_branch, narrow_branch = arg.args[2:end]
+            elided = true
+            taken = total - parsed_max >= n_required ? wide_branch : narrow_branch
+            if taken isa Expr
+                result, elided = resolve_length_check_expr!(taken, total, elided)
+                !isnothing(result) && result !== :remove && (taken = result)
+            end
+            expr.args[i] = taken
         else
             result, elided = resolve_length_check_expr!(arg, total, elided)
             if result === :remove
