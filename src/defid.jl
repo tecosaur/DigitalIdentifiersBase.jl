@@ -46,11 +46,9 @@ julia> (id.id, id.version, id.participants)
 macro defid(name, pattern, args...)
     ctx = Base.ImmutableDict{Symbol, Any}(:name, name)
     ctx = Base.ImmutableDict{Symbol, Any}(ctx, :bits, Ref(0))
-    ctx = Base.ImmutableDict{Symbol, Any}(ctx, :segments, IdSegment[])
-    ctx = Base.ImmutableDict{Symbol, Any}(ctx, :print_bytes_min, Ref(0))
-    ctx = Base.ImmutableDict{Symbol, Any}(ctx, :print_bytes_max, Ref(0))
-    ctx = Base.ImmutableDict{Symbol, Any}(ctx, :parsed_bytes_min, Ref(0))
-    ctx = Base.ImmutableDict{Symbol, Any}(ctx, :parsed_bytes_max, Ref(0))
+    root = ParseBranch(1, nothing, nothing, 0, 0, 0, 0, 0)
+    ctx = Base.ImmutableDict{Symbol, Any}(ctx, :branches, ParseBranch[root])
+    ctx = Base.ImmutableDict{Symbol, Any}(ctx, :current_branch, root)
     ctx = Base.ImmutableDict{Symbol, Any}(ctx, :casefold, true)
     ctx = Base.ImmutableDict{Symbol, Any}(ctx, :errconsts, String[])
     ctx = Base.ImmutableDict{Symbol, Any}(ctx, :__module__, __module__)
@@ -61,15 +59,11 @@ macro defid(name, pattern, args...)
             throw(ArgumentError("Unknown keyword argument $kwname. Known keyword arguments are: $(join(ALL_KNOWN_KEYS, ", "))"))
         ctx = Base.ImmutableDict{Symbol, Any}(ctx, kwname, kwval)
     end
-    exprs = IdExprs(([], [], []))
-    # Strip leading prefixes (stripname/purlprefix) before the main pattern
+    exprs = IdExprs(([], [], [], []))
+    # Strip PURL prefix before the main pattern
     prefix = get(ctx, :purlprefix, nothing)
-    stripname = get(ctx, :stripname, true)::Bool
-    skipprefixes = String[]
-    !isnothing(prefix) && push!(skipprefixes, lowercase(prefix))
-    stripname && push!(skipprefixes, lowercase(string(name)) * ":")
-    if !isempty(skipprefixes)
-        defid_dispatch!(exprs, ctx, Expr(:call, :skip, skipprefixes...))
+    if !isnothing(prefix)
+        defid_dispatch!(exprs, ctx, Expr(:call, :skip, lowercase(prefix)))
     end
     defid_dispatch!(exprs, ctx, :__first_nonskip)
     defid_dispatch!(exprs, ctx, pattern)
@@ -81,11 +75,92 @@ end
 end
 
 const ExprVarLine = Union{Expr, Symbol, LineNumberNode}
-const IdExprs = @NamedTuple{parse::Vector{ExprVarLine},
-                            print::Vector{ExprVarLine},
-                            properties::Vector{Pair{Symbol, Vector{ExprVarLine}}}}
+# Unified segment: each value-carrying pattern node pushes one of these
+const IdValueSegment = @NamedTuple{
+    nbits::Int,                            # bits consumed in packed representation
+    kind::Symbol,                          # :digits, :choice, :letters, :alphnum, :literal, :skip
+    label::Symbol,                         # attr_fieldname (inside field) or gensym (anonymous)
+    desc::String,                          # human-readable description
+    argtype::Any,                          # :Integer, :Symbol, :AbstractString, or nothing (non-parameterisable)
+    argvar::Symbol,                        # gensym used as parameter placeholder in impart
+    extract::Vector{ExprVarLine},          # bits → typed value (last expr is the value)
+    impart::Vector{Any},                   # argvar → packed bits (validate + encode + orshift)
+    condition::Union{Nothing, Symbol},     # optional scope gensym, nothing if required
+}
+const IdExprs = @NamedTuple{
+    parse::Vector{ExprVarLine},
+    print::Vector{ExprVarLine},
+    segments::Vector{IdValueSegment},
+    properties::Vector{Pair{Symbol, Union{Symbol, Vector{ExprVarLine}}}},
+}
 
-const IdSegment = @NamedTuple{nbits::Int, kind::Symbol, label::Symbol, desc::String}
+"""Per-branch byte counters for tracking parse/print bounds through optional nesting."""
+mutable struct ParseBranch
+    const id::Int                              # 1-based index into branches registry
+    const parent::Union{Nothing, ParseBranch}  # nothing for root
+    const scope::Union{Nothing, Symbol}        # optional gensym (the boolean flag)
+    const start_min::Int                       # parsed_min at branch creation
+    parsed_min::Int                            # cumulative min input bytes consumed
+    parsed_max::Int                            # cumulative max input bytes consumed
+    print_min::Int                             # cumulative min output bytes produced
+    print_max::Int                             # cumulative max output bytes produced
+end
+
+inc_parsed!(ctx, dmin, dmax) =
+    let b = ctx[:current_branch]; b.parsed_min += dmin; b.parsed_max += dmax end
+inc_print!(ctx, dmin, dmax) =
+    let b = ctx[:current_branch]; b.print_min += dmin; b.print_max += dmax end
+
+"""Resolve `__branch_check(Bool, id)`: `true` when zero-content or parent subsumes, else runtime check."""
+function resolve_branch_check(b::ParseBranch)
+    local_min = b.parsed_min - b.start_min
+    local_min <= 0 || (!isnothing(b.parent) && b.parent.parsed_min >= b.parsed_min) ?
+        true : :(nbytes - pos + 1 >= $local_min)
+end
+
+"""Non-value segment (literal, skip, zero-bit choice): no extract/impart/argtype."""
+nullsegment(; nbits::Int, kind::Symbol, label::Symbol, desc::String,
+              condition::Union{Nothing, Symbol}) =
+    IdValueSegment((nbits, kind, label, desc, nothing, :_, ExprVarLine[], Any[], condition))
+
+"""Filter nothings and LineNumberNodes from a quote block's args."""
+clean_quote_args(block::Expr) =
+    filter(e -> !isnothing(e) && !(e isa LineNumberNode), block.args)
+
+"""Wrap impart body in `if !isnothing(argvar) ... end` for optional segments."""
+wrap_optional_impart(argvar::Symbol, body) =
+    Expr(:if, :(!isnothing($argvar)), Expr(:block, body...))
+
+"""Strip `attr_` prefix from a fieldvar to get the segment label."""
+seg_label(fieldvar::Symbol) = Symbol(chopprefix(String(fieldvar), "attr_"))
+
+"""Generate the zero-initialized `parsed` expression for the packed identifier."""
+zero_parsed_expr(ctx, name) =
+    if ctx[:bits][] <= 8
+        :(Core.bitcast($(esc(name)), 0x00))
+    else
+        :(Core.Intrinsics.zext_int($(esc(name)), 0x0))
+    end
+
+"""
+Map properties to `(name, segment_indices)` pairs, resolving Symbol refs to segments.
+Returns a vector of `(property_name, [segment_index, ...])` pairs.
+"""
+function resolve_property_segments(properties, segs::Vector{IdValueSegment})
+    result = Pair{Symbol, Vector{Int}}[]
+    for (pname, val) in properties
+        if val isa Symbol
+            idx = findfirst(s -> s.label == val, segs)
+            isnothing(idx) && continue
+            push!(result, pname => [idx])
+        else
+            idxs = [i for (i, s) in enumerate(segs)
+                     if !isnothing(s.argtype) && s.label == pname]
+            push!(result, pname => idxs)
+        end
+    end
+    result
+end
 
 const KNOWN_KEYS = (
     choice = (:casefold, :is),
@@ -93,7 +168,7 @@ const KNOWN_KEYS = (
     letters = (:upper, :lower, :casefold),
     alphnum = (:upper, :lower, :casefold),
     skip = (:casefold, :print),
-    _global = (:purlprefix, :stripname)
+    _global = (:purlprefix,)
 )
 
 const ALL_KNOWN_KEYS = Tuple(unique(collect(Iterators.flatten(values(KNOWN_KEYS)))))
@@ -117,19 +192,7 @@ Base.@assume_effects :foldable function cardtype(minbits::Int)
 end
 
 """The smallest unsigned integer type that can hold `nd` bytes."""
-function swar_type(num_digits::Integer)
-    if num_digits <= 1
-        UInt8
-    elseif num_digits <= 2
-        UInt16
-    elseif num_digits <= 4
-        UInt32
-    elseif num_digits <= 8
-        UInt64
-    else
-        throw(ArgumentError("Cannot handle more than 8 bytes with SWAR techniques, but $num_digits bytes were requested"))
-    end
-end
+swar_type(nd::Int) = nd <= 1 ? UInt8 : nd <= 2 ? UInt16 : nd <= 4 ? UInt32 : UInt64
 
 """Register a compile-time error message and return its 1-based index for use as an error code."""
 function defid_errmsg(ctx::Base.ImmutableDict{Symbol, Any}, msg::String)
@@ -207,9 +270,10 @@ function defid_dispatch!(exprs::IdExprs,
     elseif thing isa String
         defid_literal!(exprs, ctx, thing)
     elseif thing === :__first_nonskip
-        ctx[:parsed_bytes_min][] = 0
-        ctx[:parsed_bytes_max][] = 0
-        push!(exprs.parse, Expr(:call, :__upfront_lengthcheck))
+        root = ctx[:current_branch]
+        root.parsed_min = 0
+        root.parsed_max = 0
+        push!(exprs.parse, Expr(:call, :__branch_check, root.id, nothing))
     end
 end
 
@@ -218,27 +282,28 @@ function defid_field!(exprs::IdExprs,
                       node::QuoteNode,
                       args::Vector{Any})
     isnothing(get(ctx, :fieldvar, nothing)) || throw(ArgumentError("Fields may not be nested"))
-    fieldvals = Any[]
     ctx = Base.ImmutableDict{Symbol, Any}(ctx, :fieldvar, Symbol("attr_$(node.value)"))
-    ctx = Base.ImmutableDict{Symbol, Any}(ctx, :fieldvals, fieldvals)
+    initial_segs = length(exprs.segments)
     initialprints = length(exprs.print)
     for arg in args
         defid_dispatch!(exprs, ctx, arg)
     end
-    if length(fieldvals) == 0
-        throw(ArgumentError("Field $(node.value) does not capture any value"))
-    elseif length(fieldvals) == 1
-        fv = first(fieldvals)
-        push!(exprs.properties, node.value => if fv isa Expr; fv.args else [fv] end)
+    # Count new value-carrying segments (those with argtype !== nothing)
+    new_value_segs = filter(s -> !isnothing(s.argtype), @view exprs.segments[initial_segs+1:end])
+    isempty(new_value_segs) && throw(ArgumentError("Field $(node.value) does not capture any value"))
+    if length(new_value_segs) == 1
+        # Single value segment: property references the segment's extract directly
+        push!(exprs.properties, node.value => new_value_segs[1].label)
     else
+        # Multi-node field: property assembles via IOBuffer from print expressions
         propprints = map(strip_segsets! ∘ copy, exprs.print[initialprints+1:end])
         filter!(e -> !Meta.isexpr(e, :(=), 2) || first(e.args) !== :__segment_printed, propprints)
-        push!(exprs.properties, node.value => (
+        push!(exprs.properties, node.value => ExprVarLine[(
             quote
                 io = IOBuffer()
                 $(propprints...)
                 takestring!(io)
-            end).args)
+            end).args...])
     end
 end
 
@@ -248,9 +313,14 @@ function defid_optional!(exprs::IdExprs,
     popt = get(ctx, :optional, nothing)
     ctx = Base.ImmutableDict{Symbol, Any}(ctx, :optional, gensym("optional"))
     ctx = Base.ImmutableDict{Symbol, Any}(ctx, :oprint_detect, ExprVarLine[])
-    oexprs = (; parse = ExprVarLine[], print = ExprVarLine[], properties = exprs.properties)
-    saved_print_min = ctx[:print_bytes_min][]
-    saved_parse_min = ctx[:parsed_bytes_min][]
+    # Fork a child branch for this optional scope
+    parent = ctx[:current_branch]
+    child = ParseBranch(length(ctx[:branches]) + 1, parent, ctx[:optional],
+                        parent.parsed_min, parent.parsed_min, parent.parsed_max,
+                        parent.print_min, parent.print_max)
+    push!(ctx[:branches], child)
+    ctx = Base.ImmutableDict{Symbol, Any}(ctx, :current_branch, child)
+    oexprs = (; parse = ExprVarLine[], print = ExprVarLine[], segments = exprs.segments, properties = exprs.properties)
     if all(a -> a isa String, args)
         defid_choice!(oexprs, ctx, push!(Any[join(Vector{String}(args))], ""))
     else
@@ -258,8 +328,9 @@ function defid_optional!(exprs::IdExprs,
             defid_dispatch!(oexprs, ctx, arg)
         end
     end
-    ctx[:print_bytes_min][] = saved_print_min
-    ctx[:parsed_bytes_min][] = saved_parse_min
+    # Merge max back to parent; min stays unchanged (optional content doesn't raise the guarantee)
+    parent.parsed_max = Base.max(parent.parsed_max, child.parsed_max)
+    parent.print_max = Base.max(parent.print_max, child.print_max)
     optvar = ctx[:optional]
     # Rewind pos when the optional has multiple nodes: an early node may advance
     # pos before a later node fails and sets option=false. Not needed when the
@@ -267,12 +338,12 @@ function defid_optional!(exprs::IdExprs,
     needs_rewind = length(args) > 1 && !all(a -> a isa String, args)
     savedpos = needs_rewind ? gensym("savedpos") : nothing
     needs_rewind && push!(exprs.parse, :($savedpos = pos))
-    push!(exprs.parse, :($optvar = true))
-    if isnothing(popt)
-        append!(exprs.parse, oexprs.parse)
-    else
-        push!(exprs.parse, :(if $popt; $(oexprs.parse...) end))
-    end
+    # Branch check as condition: when resolved, guarantees local_min bytes
+    # are available, allowing sentinels within the branch to fold safely.
+    branch_check = Expr(:call, :__branch_check, Bool, child.id)
+    guard = isnothing(popt) ? branch_check : :($popt && $branch_check)
+    push!(exprs.parse, :($optvar = $guard))
+    push!(exprs.parse, :(if $optvar; $(oexprs.parse...) end))
     needs_rewind && push!(exprs.parse, :($optvar || (pos = $savedpos)))
     append!(exprs.print, ctx[:oprint_detect])
     push!(exprs.print, :(if $(ctx[:optional]); $(oexprs.print...) end))
@@ -291,12 +362,13 @@ function defid_skip!(exprs::IdExprs,
         all(isascii, sargs) || throw(ArgumentError("Expected all arguments to be ASCII strings for skip with casefolding"))
     end
     push!(exprs.parse, gen_static_lchop(casefold ? map(lowercase, sargs) : sargs, casefold=casefold))
-    ctx[:parsed_bytes_max][] += maximum(ncodeunits, sargs)
+    inc_parsed!(ctx, 0, maximum(ncodeunits, sargs))
     if !isnothing(pval)
-        push!(ctx[:segments], (0, :skip, :skip, "Skipped literal string \"$(join(sargs, ", "))\""))
-        push!(exprs.print, :(print(io, $pval)), :(__segment_printed = $(length(ctx[:segments]))))
-        ctx[:print_bytes_min][] += ncodeunits(pval)
-        ctx[:print_bytes_max][] += ncodeunits(pval)
+        push!(exprs.segments, nullsegment(nbits=0, kind=:skip, label=:skip,
+              desc="Skipped literal string \"$(join(sargs, ", "))\"",
+              condition=get(ctx, :optional, nothing)))
+        push!(exprs.print, :(print(io, $pval)), :(__segment_printed = $(length(exprs.segments))))
+        inc_print!(ctx, ncodeunits(pval), ncodeunits(pval))
     end
     nothing
 end
@@ -678,8 +750,7 @@ function defid_choice!(exprs::IdExprs,
             if use_wide_vt
                 ve_wide = gen_verify_exprs(vt_wide, fieldvar)
                 wide_block = Expr(:block, ve_wide.destructure..., :(found = $(ve_wide.checks)))
-                chosen = Expr(:call, :__ifelse_length_exceeds, wide_minlen,
-                              ctx[:parsed_bytes_min][], ctx[:parsed_bytes_max][],
+                chosen = Expr(:if, defid_static_lengthcheck(ctx, wide_minlen),
                               wide_block, verify_block)
                 push!(parts,
                       :(if found
@@ -748,34 +819,49 @@ function defid_choice!(exprs::IdExprs,
     end
     if isnothing(target)
         nbits = (ctx[:bits][] += choicebits)
-        ctx[:print_bytes_min][] += minimum(ncodeunits, soptions)
-        ctx[:print_bytes_max][] += maximum(ncodeunits, soptions)
-        ctx[:parsed_bytes_min][] += minimum(ncodeunits, soptions)
-        ctx[:parsed_bytes_max][] += maximum(ncodeunits, soptions)
+        inc_print!(ctx, minimum(ncodeunits, soptions), maximum(ncodeunits, soptions))
+        inc_parsed!(ctx, minimum(ncodeunits, soptions), maximum(ncodeunits, soptions))
         push!(exprs.parse,
               :($fieldvar = zero($choiceint)),
               checkedmatch,
               defid_orshift(ctx, choiceint, fieldvar, nbits))
         fextract = :($fieldvar = $(defid_fextract(ctx, nbits, choicebits)))
-        push!(ctx[:segments], (choicebits, :choice, Symbol(chopprefix(String(fieldvar), "attr_")),
-                               join(soptions, " | ")))
         if isnothing(option)
             push!(exprs.print, fextract)
         else
             push!(ctx[:oprint_detect], fextract, :($option = !iszero($fieldvar)))
         end
+        # Build extract and impart for the segment
+        symoptions = Tuple(Symbol.(soptions))
+        seg_extract = if isnothing(option)
+            ExprVarLine[fextract, :(@inbounds $(symoptions)[$fieldvar])]
+        else
+            ExprVarLine[fextract, :(if !iszero($fieldvar) @inbounds $(symoptions)[$fieldvar] end)]
+        end
+        # Constructor impart: validate Symbol → 1-based index → pack
+        argvar = gensym("arg_choice")
+        seg_impart = Any[]
+        impart_core = Any[
+            :($fieldvar = let idx = findfirst(==(Symbol($argvar)), $symoptions)
+                  isnothing(idx) && throw(ArgumentError(
+                      string("Invalid option :", $argvar, "; expected one of: ", $(join(soptions, ", ")))))
+                  idx % $choiceint
+              end),
+            defid_orshift(ctx, choiceint, fieldvar, nbits)]
+        if isnothing(option)
+            append!(seg_impart, impart_core)
+            seg_argtype = :Symbol
+        else
+            push!(seg_impart, wrap_optional_impart(argvar, impart_core))
+            seg_argtype = :(Union{Symbol, Nothing})
+        end
+        push!(exprs.segments, (; nbits=choicebits, kind=:choice,
+              label=seg_label(fieldvar),
+              desc=join(soptions, " | "), argtype=seg_argtype, argvar,
+              extract=seg_extract, impart=seg_impart, condition=option))
         push!(exprs.print,
               :(print(io, @inbounds $(Tuple(soptions))[$fieldvar])),
-              :(__segment_printed = $(length(ctx[:segments]))))
-        if haskey(ctx, :fieldvals)
-            symoptions = Tuple(Symbol.(soptions))
-            push!(ctx[:fieldvals],
-                if isnothing(option)
-                    :($fextract; @inbounds $(symoptions)[$fieldvar])
-                else
-                    :($fextract; if !iszero($fieldvar) @inbounds $(symoptions)[$fieldvar] end)
-                end)
-        end
+              :(__segment_printed = $(length(exprs.segments))))
     else
         if any(isempty, soptions)
             push!(exprs.parse, matcher)
@@ -784,13 +870,13 @@ function defid_choice!(exprs::IdExprs,
                   :($fieldvar = zero($choiceint)),
                   checkedmatch)
         end
-        ctx[:print_bytes_min][] += ncodeunits(target)
-        ctx[:print_bytes_max][] += ncodeunits(target)
-        ctx[:parsed_bytes_min][] += minimum(ncodeunits, soptions)
-        ctx[:parsed_bytes_max][] += maximum(ncodeunits, soptions)
-        push!(ctx[:segments], (0, :choice, Symbol(chopprefix(String(fieldvar), "attr_")),
-                               "Choice of literal string \"$(target)\" vs $(join(soptions, ", "))"))
-        push!(exprs.print, :(print(io, $target)), :(__segment_printed = $(length(ctx[:segments]))))
+        inc_print!(ctx, ncodeunits(target), ncodeunits(target))
+        inc_parsed!(ctx, minimum(ncodeunits, soptions), maximum(ncodeunits, soptions))
+        push!(exprs.segments, nullsegment(nbits=0, kind=:choice,
+              label=seg_label(fieldvar),
+              desc="Choice of literal string \"$(target)\" vs $(join(soptions, ", "))",
+              condition=option))
+        push!(exprs.print, :(print(io, $target)), :(__segment_printed = $(length(exprs.segments))))
     end
     nothing
 end
@@ -953,8 +1039,8 @@ function defid_literal!(exprs::IdExprs,
     end
     litref = casefold ? lowercase(lit) : lit
     litlen = ncodeunits(litref)
-    # When widening to fewer loads is possible, emit both paths and let
-    # __ifelse_length_exceeds pick at resolution time
+    # When widening to fewer loads is possible, emit both paths gated by
+    # __static_length_check; fold_static_branches! picks the winner.
     wide_n = min(nextpow(2, litlen), sizeof(UInt) * cld(litlen, sizeof(UInt)))
     use_wide = wide_n > litlen && length(word_chunks(wide_n)) < length(word_chunks(litlen))
     mismatch = if use_wide
@@ -962,9 +1048,7 @@ function defid_literal!(exprs::IdExprs,
         wide_mm = :(!($(foldl((a, b) -> :($a && $b), wide_checks))))
         narrow_checks = gen_static_stringcomp(litref, casefold)
         narrow_mm = :(!($(foldl((a, b) -> :($a && $b), narrow_checks))))
-        Expr(:call, :__ifelse_length_exceeds, wide_n,
-             ctx[:parsed_bytes_min][], ctx[:parsed_bytes_max][],
-             wide_mm, narrow_mm)
+        Expr(:if, defid_static_lengthcheck(ctx, wide_n), wide_mm, narrow_mm)
     else
         checks = gen_static_stringcomp(litref, casefold)
         :(!($(foldl((a, b) -> :($a && $b), checks))))
@@ -995,20 +1079,11 @@ function defid_literal!(exprs::IdExprs,
                      end
                  end).args)
     end
-    push!(ctx[:segments], (0, :literal, :literal, sprint(show, lit)))
-    push!(exprs.print, :(print(io, $lit)), :(__segment_printed = $(length(ctx[:segments]))))
-    ctx[:print_bytes_min][] += litlen
-    ctx[:print_bytes_max][] += litlen
-    ctx[:parsed_bytes_min][] += litlen
-    ctx[:parsed_bytes_max][] += litlen
-    if haskey(ctx, :fieldvals)
-        push!(ctx[:fieldvals],
-              if isnothing(option)
-                  lit
-              else
-                  :(if $option; $lit end)
-              end)
-    end
+    push!(exprs.segments, nullsegment(nbits=0, kind=:literal, label=:literal,
+          desc=sprint(show, lit), condition=option))
+    push!(exprs.print, :(print(io, $lit)), :(__segment_printed = $(length(exprs.segments))))
+    inc_print!(ctx, litlen, litlen)
+    inc_parsed!(ctx, litlen, litlen)
     nothing
 end
 
@@ -1568,19 +1643,16 @@ function gen_digit_fixed_guarded(vocab, ctx::Base.ImmutableDict{Symbol, Any},
                                  check_fn,
                                  parse_and_encode::Vector{ExprVarLine})
     (; fail_expr, option, errmsg) = vocab
-    bytes_before_min = ctx[:parsed_bytes_min][]
-    bytes_before_max = ctx[:parsed_bytes_max][]
+    b = ctx[:current_branch]
     if isnothing(option)
-        nd_guard = :(if !($(Expr(:call, :__length_check, nd, nd, nd,
-                                  bytes_before_min, bytes_before_max)))
+        nd_guard = :(if !($(Expr(:call, :__length_check, b.id, b.parsed_max, nd, nd, nd)))
                          return ($errmsg, pos)
                      end)
         ExprVarLine[nd_guard, load_exprs..., check_fn(fail_expr)...,
                     parse_and_encode..., digit_required(vocab)...]
     else
         valid = gensym("valid")
-        opt_check = Expr(:call, :__length_check, nd, nd, nd,
-                          bytes_before_min, bytes_before_max)
+        opt_check = Expr(:call, :__length_check, b.id, b.parsed_max, nd, nd, nd)
         check = check_fn(:($valid = false))
         swar_block = ExprVarLine[:($valid = true), check...,
                                  digit_optional(vocab, :($valid), parse_and_encode)...]
@@ -1603,7 +1675,7 @@ required/optional wrapping to `gen_digit_fixed_guarded`.
 Load strategy (best to worst):
 1. Backward — preceding bytes provide padding for a single sizeof(sT) load
 2. Forward overread — trailing content guarantees sizeof(sT) bytes at pos;
-   single full-width load + left-shift discards overflow (via `__ifelse_length_exceeds`)
+   single full-width load + left-shift discards overflow (via `__static_length_check`)
 3. Exact — decompose maxdigits into power-of-2 sub-loads, shift and OR
 """
 function gen_digit_swar_fixed(vocab, dspec::NamedTuple,
@@ -1613,19 +1685,18 @@ function gen_digit_swar_fixed(vocab, dspec::NamedTuple,
     sT = swar_type(maxdigits)
     swar_var = Symbol("$(vocab.fieldvar)_swar")
     # Backward load when enough preceding bytes provide padding
-    backward = ctx[:parsed_bytes_min][] >= sizeof(sT) - maxdigits
+    b = ctx[:current_branch]
+    backward = b.parsed_min >= sizeof(sT) - maxdigits
     # Forward overread: when maxdigits < sizeof(sT) and backward isn't available,
     # a full-width forward load + left-shift is cheaper than exact sub-loads.
-    # Gated by __ifelse_length_exceeds so it only activates when trailing content
+    # Gated by __static_length_check so it only activates when trailing content
     # guarantees sizeof(sT) bytes exist from pos onward.
     use_forward_overread = !backward && maxdigits < sizeof(sT)
     load = if use_forward_overread
         shift = 8 * (sizeof(sT) - maxdigits)
         wide_load = :($swar_var = htol(Base.unsafe_load(Ptr{$sT}(pointer(idbytes, pos)))) << $shift)
         narrow_load = gen_swar_load(sT, swar_var, maxdigits; backward=false)
-        Expr(:call, :__ifelse_length_exceeds, sizeof(sT),
-             ctx[:parsed_bytes_min][], ctx[:parsed_bytes_max][],
-             wide_load, narrow_load)
+        Expr(:if, defid_static_lengthcheck(ctx, sizeof(sT)), wide_load, narrow_load)
     else
         gen_swar_load(sT, swar_var, maxdigits; backward)
     end
@@ -1686,7 +1757,7 @@ Load strategy (best to worst):
    with runtime-variable position. Digit counting from LSB after right-shift low-alignment.
 2. Forward overread — trailing content guarantees sizeof(sT) bytes at pos; single
    full-width forward load, digit counting from LSB (digits naturally at LSB on LE),
-   left-shift to high-align. Via `__ifelse_length_exceeds`.
+   left-shift to high-align. Via `__static_length_check`.
 3. Cascading exact-loads — decompose maxdigits into power-of-2 sub-loads (`gen_swar_varload`)
 
 When `avail` or shifts resolve to compile-time constants, LLVM eliminates
@@ -1710,7 +1781,8 @@ function gen_digit_swar_variable(vocab, dspec::NamedTuple,
     # Backward-load: single load with runtime-variable position, branchless digit count.
     # Requires sizeof(sT) - 1 preceding bytes (worst case: avail=1, load reaches back
     # sizeof(sT) - 1 bytes). Most identifiers with a literal prefix qualify.
-    backward = ctx[:parsed_bytes_min][] >= sizeof(sT) - 1
+    b = ctx[:current_branch]
+    backward = b.parsed_min >= sizeof(sT) - 1
     availvar = Symbol("$(fieldvar)_avail")
     avail_bound = defid_lengthbound(ctx, maxdigits)
     load_and_count = if backward
@@ -1721,13 +1793,10 @@ function gen_digit_swar_variable(vocab, dspec::NamedTuple,
                 Ptr{$sT}(pointer(idbytes, pos + $availvar - $(sizeof(sT))))))),
             :($swar_var >>>= ($(sizeof(sT)) - $availvar) << 3),
             gen_swar_digitcount(sT, swar_var, countvar, base, maxdigits)...]
-        bytes_before_min = ctx[:parsed_bytes_min][]
-        bytes_before_max = ctx[:parsed_bytes_max][]
         # Guard avail >= mindigits (required) or avail >= 1 (optional) via
         # __length_check, giving resolve_length_checks! a chance to fold it away.
         guard_n = Base.max(mindigits, 1)
-        guard_check = Expr(:call, :__length_check, guard_n, guard_n, guard_n,
-                           bytes_before_min, bytes_before_max)
+        guard_check = Expr(:call, :__length_check, b.id, b.parsed_max, guard_n, guard_n, guard_n)
         if isnothing(option)
             ExprVarLine[:($availvar = $avail_bound),
                         :(if !($guard_check); return ($(vocab.errmsg), pos) end),
@@ -1744,15 +1813,12 @@ function gen_digit_swar_variable(vocab, dspec::NamedTuple,
         # Forward overread: single full-width forward load at pos. Digits land at LSB
         # (on LE with htol), so gen_swar_digitcount counts from LSB directly.
         # The sentinel-capped maxdigits in digitcount handles overflow bytes from
-        # trailing content. Gated by __ifelse_length_exceeds for trailing safety.
+        # trailing content. Gated by __static_length_check for trailing safety.
         fwdload = ExprVarLine[
             :($swar_var = htol(Base.unsafe_load(Ptr{$sT}(pointer(idbytes, pos))))),
             gen_swar_digitcount(sT, swar_var, countvar, base, maxdigits)...]
-        bytes_before_min = ctx[:parsed_bytes_min][]
-        bytes_before_max = ctx[:parsed_bytes_max][]
         guard_n = Base.max(mindigits, 1)
-        guard_check = Expr(:call, :__length_check, guard_n, guard_n, guard_n,
-                           bytes_before_min, bytes_before_max)
+        guard_check = Expr(:call, :__length_check, b.id, b.parsed_max, guard_n, guard_n, guard_n)
         fwd_guarded = if isnothing(option)
             ExprVarLine[:(if !($guard_check); return ($(vocab.errmsg), pos) end),
                         fwdload...]
@@ -1767,12 +1833,10 @@ function gen_digit_swar_variable(vocab, dspec::NamedTuple,
         varload = gen_swar_varload(sT, swar_var, countvar, availvar, base, maxdigits)
         cascade = ExprVarLine[:($countvar = 0), :($swar_var = zero($sT)),
                               :($availvar = $avail_bound), varload...]
-        # Emit both paths; __ifelse_length_exceeds selects at resolution time
+        # Emit both paths; __static_length_check + fold_static_branches! picks the winner
         wide = Expr(:block, fwd_guarded...)
         narrow = Expr(:block, cascade...)
-        ExprVarLine[Expr(:call, :__ifelse_length_exceeds, sizeof(sT),
-                         bytes_before_min, bytes_before_max,
-                         wide, narrow)]
+        ExprVarLine[Expr(:if, defid_static_lengthcheck(ctx, sizeof(sT)), wide, narrow)]
     end
     if isnothing(option)
         swar_core = ExprVarLine[load_and_count...,
@@ -1864,10 +1928,8 @@ function defid_digits!(exprs::IdExprs,
     # gen_digit_parse reads ctx[:parsed_bytes_*] for SWAR safety, so call before updating
     dspec = (; base, mindigits, maxdigits, min, max, pad, dI, dT)
     parsed = gen_digit_parse(ctx, fieldvar, option, dspec)
-    ctx[:print_bytes_min][] += printmin
-    ctx[:print_bytes_max][] += printmax
-    ctx[:parsed_bytes_min][] += mindigits
-    ctx[:parsed_bytes_max][] += maxdigits
+    inc_print!(ctx, printmin, printmax)
+    inc_parsed!(ctx, mindigits, maxdigits)
     fnum = Symbol("$(fieldvar)_num")
     bitsconsumed = Symbol("$(fieldvar)_bitsconsumed")
     (; parsevar, directvar) = parsed
@@ -1900,39 +1962,71 @@ function defid_digits!(exprs::IdExprs,
     else
         :(print(io, string($printvar, base=$base)))
     end
-    push!(ctx[:segments], (dbits, :digits, Symbol(chopprefix(String(fieldvar), "attr_")),
-                           string(fixedwidth ? "$maxdigits" : "$mindigits-$maxdigits",
-                                  isone(maxdigits) ? " digit" : " digits",
-                                  base != 10 ? " in base $base" : "",
-                                  if min > 0 && max < base^maxdigits - 1
-                                      " between $(string(min; base, pad)) and $(string(max; base, pad))"
-                                  elseif min > 0
-                                      ", at least $(string(min; base, pad))"
-                                  elseif max < base^maxdigits - 1
-                                      ", at most $(string(max; base, pad))"
-                                  else "" end)))
-    segsym = :(__segment_printed = $(length(ctx[:segments])))
+    seg_desc = string(fixedwidth ? "$maxdigits" : "$mindigits-$maxdigits",
+                      isone(maxdigits) ? " digit" : " digits",
+                      base != 10 ? " in base $base" : "",
+                      if min > 0 && max < base^maxdigits - 1
+                          " between $(string(min; base, pad)) and $(string(max; base, pad))"
+                      elseif min > 0
+                          ", at least $(string(min; base, pad))"
+                      elseif max < base^maxdigits - 1
+                          ", at most $(string(max; base, pad))"
+                      else "" end)
     if isnothing(option)
         push!(exprs.print, fextract)
     else
         push!(ctx[:oprint_detect], fextract, :($option = !iszero($fnum)))
     end
     directvar || push!(exprs.print, :($fieldvar = $fvalue))
-    push!(exprs.print, printex, segsym)
-    if haskey(ctx, :fieldvals)
-        propvalue = if max < typemax(dI) ÷ 2
-            sI = signed(dI)
-            :($fvalue % $sI)
-        else
-            fvalue
-        end
-        push!(ctx[:fieldvals],
-              if isnothing(option)
-                  :($fextract; $propvalue)
-              else
-                  :($fextract; if !iszero($fnum); $propvalue end)
-              end)
+    # Build extract for property access
+    propvalue = if max < typemax(dI) ÷ 2
+        sI = signed(dI)
+        :($fvalue % $sI)
+    else
+        fvalue
     end
+    seg_extract = if isnothing(option)
+        ExprVarLine[fextract, propvalue]
+    else
+        ExprVarLine[fextract, :(if !iszero($fnum); $propvalue end)]
+    end
+    # Build impart for constructor encoding
+    argvar = gensym("arg_digit")
+    seg_impart = Any[]
+    directval = cardbits(max - min + 1 + !isnothing(option)) ==
+                cardbits(max) && (min > 0 || isnothing(option))
+    # Compute encode_expr: maps fnum → parsevar with appropriate offset
+    offset = min - !isnothing(option)
+    encode_expr = if directval
+        dI != dT ? :($parsevar = $fnum % $dT) : :($parsevar = $fnum)
+    elseif offset > 0
+        :($parsevar = (($fnum - $(dT(offset))) % $dT))
+    elseif offset < 0  # optional with min==0: +1 to reserve zero for "absent"
+        :($parsevar = ($fnum + $(one(dT))) % $dT)
+    else
+        dI != dT ? :($parsevar = $fnum % $dT) : :($parsevar = $fnum)
+    end
+    # Assemble validation + encoding
+    body = Any[]
+    push!(body, :($argvar >= $min || throw(ArgumentError(
+        string("Value ", $argvar, " is below minimum ", $min)))))
+    push!(body, :($argvar <= $max || throw(ArgumentError(
+        string("Value ", $argvar, " is above maximum ", $max)))))
+    push!(body, :($fnum = $argvar % $dI))
+    directvar || push!(body, encode_expr)
+    push!(body, defid_orshift(ctx, dT, parsevar, nbits))
+    if isnothing(option)
+        append!(seg_impart, body)
+        seg_argtype = :Integer
+    else
+        push!(seg_impart, wrap_optional_impart(argvar, body))
+        seg_argtype = :(Union{Integer, Nothing})
+    end
+    push!(exprs.segments, (; nbits=dbits, kind=:digits,
+          label=seg_label(fieldvar),
+          desc=seg_desc, argtype=seg_argtype, argvar,
+          extract=seg_extract, impart=seg_impart, condition=option))
+    push!(exprs.print, printex, :(__segment_printed = $(length(exprs.segments))))
     nothing
 end
 
@@ -1999,10 +2093,8 @@ function defid_charseq!(exprs::IdExprs,
     cfold = cfg.casefold
     nbits_pos = (ctx[:bits][] += totalbits)
     scanlimit = defid_lengthbound(ctx, maxlen)
-    ctx[:print_bytes_min][] += minlen
-    ctx[:print_bytes_max][] += maxlen
-    ctx[:parsed_bytes_min][] += minlen
-    ctx[:parsed_bytes_max][] += maxlen
+    inc_print!(ctx, minlen, maxlen)
+    inc_parsed!(ctx, minlen, maxlen)
     # --- Parse ---
     push!(exprs.parse,
           :(($lenvar, $charvar) = parsechars($cT, idbytes, pos, $scanlimit, $ranges, $cfold, $oneindexed)))
@@ -2081,20 +2173,62 @@ function defid_charseq!(exprs::IdExprs,
         append!(exprs.print, extracts)
     end
     push!(exprs.print, printex)
-    push!(ctx[:segments],
-          (totalbits, kind, Symbol(chopprefix(String(fieldvar), "attr_")),
-           string(variable ? "$minlen-$maxlen" : "$maxlen",
-                  " ", kind, maxlen > 1 ? " characters" : " character")))
-    push!(exprs.print, :(__segment_printed = $(length(ctx[:segments]))))
-    # --- Field value ---
-    if haskey(ctx, :fieldvals)
-        push!(ctx[:fieldvals],
-              if isnothing(option)
-                  :($(extracts...); $tostringex)
-              else
-                  :($(extracts...); if $present; $tostringex end)
-              end)
+    # Build extract for property access
+    seg_extract = if isnothing(option)
+        ExprVarLine[extracts..., tostringex]
+    else
+        ExprVarLine[extracts..., :(if $present; $tostringex end)]
     end
+    # Build impart for constructor encoding
+    argvar = gensym("arg_charseq")
+    seg_impart = Any[]
+    encode_chars = quote
+        ($lenvar, $charvar) = parsechars($cT, String($argvar), $maxlen, $ranges, $cfold, $oneindexed)
+        $lenvar == ncodeunits(String($argvar)) || throw(ArgumentError(
+            string("Invalid characters in \"", $argvar, "\" for ", $(String(kind)))))
+        $(if variable
+              quote
+                  $lenvar < $minlen && throw(ArgumentError(
+                      string("String \"", $argvar, "\" is too short (minimum ", $minlen, " characters)")))
+                  $lenvar > $maxlen && throw(ArgumentError(
+                      string("String \"", $argvar, "\" is too long (maximum ", $maxlen, " characters)")))
+              end
+          else
+              :($lenvar != $maxlen && throw(ArgumentError(
+                  string("String \"", $argvar, "\" must be exactly ", $maxlen, " characters"))))
+          end)
+        $(defid_orshift(ctx, cT, charvar, nbits_pos - lenbits - presbits))
+        $(if variable
+              lenpack_expr = if lenbase == 0
+                  :($lenoffset = $lenvar % $lT)
+              else
+                  :($lenoffset = ($lenvar - $lenbase) % $lT)
+              end
+              quote
+                  $lenpack_expr
+                  $(defid_orshift(ctx, lT, lenoffset, nbits_pos))
+              end
+          elseif presbits > 0
+              defid_orshift(ctx, Bool, true, nbits_pos)
+          else
+              nothing
+          end)
+    end
+    charseq_body = clean_quote_args(encode_chars)
+    if isnothing(option)
+        append!(seg_impart, charseq_body)
+        seg_argtype = :AbstractString
+    else
+        push!(seg_impart, wrap_optional_impart(argvar, charseq_body))
+        seg_argtype = :(Union{AbstractString, Nothing})
+    end
+    push!(exprs.segments, (; nbits=totalbits, kind,
+          label=seg_label(fieldvar),
+          desc=string(variable ? "$minlen-$maxlen" : "$maxlen",
+                      " ", kind, maxlen > 1 ? " characters" : " character"),
+          argtype=seg_argtype, argvar, extract=seg_extract, impart=seg_impart,
+          condition=option))
+    push!(exprs.print, :(__segment_printed = $(length(exprs.segments))))
     nothing
 end
 
@@ -2118,49 +2252,57 @@ end
 """
     defid_lengthcheck(ctx, n_expr, [n_min, n_max])
 
-Emit a `__length_check(n_expr, n_min, n_max, parsed_min, parsed_max)` sentinel resolved by
-`resolve_length_checks!` once the final parse byte minimum is known.
+Emit a `__length_check(branch_id, emission_max, n_min, n_max, n_expr)` sentinel resolved by
+`resolve_length_checks!` once the branch's final parse byte minimum is known.
 """
 function defid_lengthcheck(ctx::Base.ImmutableDict{Symbol, Any}, n_expr, n_min::Int=n_expr, n_max::Int=n_min)
-    Expr(:call, :__length_check, n_expr, n_min, n_max, ctx[:parsed_bytes_min][], ctx[:parsed_bytes_max][])
+    b = ctx[:current_branch]
+    Expr(:call, :__length_check, b.id, b.parsed_max, n_min, n_max, n_expr)
 end
+
+"""Emit a `__static_length_check` sentinel resolving to `true`/`false` (never runtime)."""
+defid_static_lengthcheck(ctx::Base.ImmutableDict{Symbol, Any}, n::Int) =
+    let b = ctx[:current_branch]; Expr(:call, :__static_length_check, b.id, b.parsed_max, n) end
 
 """
     defid_lengthbound(ctx, n)
 
-Emit a `__length_bound(n, parsed_min, parsed_max)` sentinel that resolves to
+Emit a `__length_bound(branch_id, emission_max, n)` sentinel that resolves to
 `n` when enough bytes are guaranteed, or `min(n, nbytes - pos + 1)` at runtime.
 """
 function defid_lengthbound(ctx::Base.ImmutableDict{Symbol, Any}, n::Int)
-    Expr(:call, :__length_bound, n, ctx[:parsed_bytes_min][], ctx[:parsed_bytes_max][])
+    b = ctx[:current_branch]
+    Expr(:call, :__length_bound, b.id, b.parsed_max, n)
 end
 
 """
-    resolve_length_checks!(exprs, total_parsed_min)
+    resolve_length_checks!(exprs, branches)
 
-Walk the AST and resolve `__length_check` sentinels. When the total minimum
-guarantees enough bytes remain (`total_parsed_min - parsed_max >= n_max`),
-the check is statically true; if/elseif branches are simplified accordingly.
-Otherwise, the sentinel is replaced with a runtime `nbytes - pos + 1 >= n_expr`.
+Walk the AST and resolve length sentinels. Each sentinel captures `(branch_id,
+emission_max, ...)` at emit time. The fold formula is
+`branches[branch_id].parsed_min - emission_max >= threshold`: for root sentinels
+this is the global minimum guarantee; for optional-branch sentinels the
+`__branch_check(Bool, id)` guard ensures the branch minimum holds at runtime.
+Also resolves `__branch_check(Bool, id)` to `true` (when `local_min <= 0` or the
+parent's guarantee subsumes the child's needs) or `nbytes - pos + 1 >= local_min`,
+`__static_length_check` to `true`/`false` (dead branches folded by
+`fold_static_branches!` afterward), and `__length_bound` similarly.
 """
-function resolve_length_checks!(exprlikes::Vector{<:ExprVarLine}, total_parsed_min::Int)
+function resolve_length_checks!(exprlikes::Vector{<:ExprVarLine}, branches::Vector{ParseBranch})
     elided = false
     splice_indices = Int[]
     for (idx, expr) in enumerate(exprlikes)
         expr isa Expr || continue
-        # Handle top-level sentinels that aren't nested inside another expr
-        if Meta.isexpr(expr, :call) && first(expr.args) === :__ifelse_length_exceeds
-            n_required, _, parsed_max, wide_branch, narrow_branch = expr.args[2:end]
-            elided = true
-            taken = total_parsed_min - parsed_max >= n_required ? wide_branch : narrow_branch
-            if taken isa Expr
-                result, elided = resolve_length_check_expr!(taken, total_parsed_min, elided)
-                !isnothing(result) && result !== :remove && (taken = result)
+        if Meta.isexpr(expr, :call) && first(expr.args) === :__branch_check
+            if expr.args[2] === Bool
+                val = resolve_branch_check(branches[expr.args[3]])
+                elided |= val isa Bool
+                exprlikes[idx] = val
             end
-            exprlikes[idx] = taken
+            # Root branch check (args[2] is Int): leave for defid_parsebytes
             continue
         end
-        result, elided = resolve_length_check_expr!(expr, total_parsed_min, elided)
+        result, elided = resolve_length_check_expr!(expr, branches, elided)
         if result === :remove
             push!(splice_indices, idx)
         elseif !isnothing(result)
@@ -2171,15 +2313,19 @@ function resolve_length_checks!(exprlikes::Vector{<:ExprVarLine}, total_parsed_m
     exprlikes, elided
 end
 
-# Resolve __length_check to true or a runtime `nbytes - pos + 1 >= n` expression
-function resolve_length_check_value(expr::Expr, total_parsed_min::Int)
-    n_expr, n_min, n_max, parsed_min, parsed_max = expr.args[2:end]
-    total_parsed_min - parsed_max >= n_max ? true : :(nbytes - pos + 1 >= $n_expr)
+# Resolve __length_check to true or a runtime `nbytes - pos + 1 >= n` expression.
+# Uses the sentinel's branch parsed_min as the guarantee: for the root branch this
+# is the global minimum; for optional branches, the __branch_check guard ensures
+# the branch minimum holds when the code executes. The branch-local emission_max
+# avoids the old system's problem where optionals inflated the global max.
+function resolve_length_check_value(expr::Expr, branches::Vector{ParseBranch})
+    branch_id, emission_max, _, n_max, n_expr = expr.args[2:end]
+    branches[branch_id].parsed_min - emission_max >= n_max ? true : :(nbytes - pos + 1 >= $n_expr)
 end
 
 # Walk and resolve. Returns (replacement, elided) where replacement is
 # :remove, a value to splice in (Expr or literal), or nothing (modified in-place).
-function resolve_length_check_expr!(expr::Expr, total::Int, elided::Bool)
+function resolve_length_check_expr!(expr::Expr, branches::Vector{ParseBranch}, elided::Bool)
     # if/elseif with __length_check or !__length_check condition — special
     # handling to fold away the entire branch when statically known
     if expr.head in (:if, :elseif)
@@ -2193,7 +2339,7 @@ function resolve_length_check_expr!(expr::Expr, total::Int, elided::Bool)
             (nothing, false)
         end
         if !isnothing(check)
-            val = resolve_length_check_value(check, total)
+            val = resolve_length_check_value(check, branches)
             if val isa Bool
                 # Statically known — keep the taken branch, discard the other
                 elided = true
@@ -2212,13 +2358,14 @@ function resolve_length_check_expr!(expr::Expr, total::Int, elided::Bool)
                 isnothing(promoted) && return :remove, elided
                 # Recurse into the promoted branch to resolve any nested sentinels
                 if promoted isa Expr
-                    result, elided = resolve_length_check_expr!(promoted, total, elided)
+                    result, elided = resolve_length_check_expr!(promoted, branches, elided)
                     !isnothing(result) && (promoted = result)
                 end
                 return promoted, elided
             end
-            # Runtime — replace sentinel with actual comparison
-            expr.args[1] = negated ? :(nbytes - pos + 1 < $(check.args[2])) : val
+            # Runtime — replace sentinel with actual comparison;
+            # n_expr is the 6th element in __length_check(branch_id, emission_max, n_min, n_max, n_expr)
+            expr.args[1] = negated ? :(nbytes - pos + 1 < $(check.args[6])) : val
         end
     end
     # Recurse into all children, resolving sentinels wherever they appear
@@ -2226,7 +2373,7 @@ function resolve_length_check_expr!(expr::Expr, total::Int, elided::Bool)
     for (i, arg) in enumerate(expr.args)
         arg isa Expr || continue
         if Meta.isexpr(arg, :call) && first(arg.args) === :__length_check
-            val = resolve_length_check_value(arg, total)
+            val = resolve_length_check_value(arg, branches)
             elided |= val isa Bool
             if val isa Expr
                 arg.head, arg.args = val.head, val.args
@@ -2234,26 +2381,31 @@ function resolve_length_check_expr!(expr::Expr, total::Int, elided::Bool)
                 expr.args[i] = val
             end
         elseif Meta.isexpr(arg, :call) && first(arg.args) === :__length_bound
-            n, parsed_min, parsed_max = arg.args[2:end]
-            if total - parsed_max >= n
+            branch_id, emission_max, n = arg.args[2:end]
+            if branches[branch_id].parsed_min - emission_max >= n
                 elided = true
                 expr.args[i] = n
             else
                 replacement = :(min($n, nbytes - pos + 1))
                 arg.head, arg.args = replacement.head, replacement.args
             end
-        elseif Meta.isexpr(arg, :call) && first(arg.args) === :__ifelse_length_exceeds
-            # Purely compile-time: replace with the satisfied or fallback branch
-            n_required, _, parsed_max, wide_branch, narrow_branch = arg.args[2:end]
+        elseif Meta.isexpr(arg, :call) && first(arg.args) === :__static_length_check
+            branch_id, emission_max, n = arg.args[2:end]
             elided = true
-            taken = total - parsed_max >= n_required ? wide_branch : narrow_branch
-            if taken isa Expr
-                result, elided = resolve_length_check_expr!(taken, total, elided)
-                !isnothing(result) && result !== :remove && (taken = result)
+            expr.args[i] = branches[branch_id].parsed_min - emission_max >= n
+        elseif Meta.isexpr(arg, :call) && first(arg.args) === :__branch_check
+            if arg.args[2] === Bool
+                val = resolve_branch_check(branches[arg.args[3]])
+                elided |= val isa Bool
+                if val isa Expr
+                    arg.head, arg.args = val.head, val.args
+                else
+                    expr.args[i] = val
+                end
             end
-            expr.args[i] = taken
+            # Root branch check: leave for defid_parsebytes
         else
-            result, elided = resolve_length_check_expr!(arg, total, elided)
+            result, elided = resolve_length_check_expr!(arg, branches, elided)
             if result === :remove
                 push!(splice_indices, i)
             elseif !isnothing(result)
@@ -2263,6 +2415,48 @@ function resolve_length_check_expr!(expr::Expr, total::Int, elided::Bool)
     end
     deleteat!(expr.args, splice_indices)
     nothing, elided
+end
+
+"""
+    fold_static_branches!(exprlikes)
+
+Resolve `if true`/`if false` statically: splice the taken branch, discard the dead one.
+Handles `if`/`elseif`/`else` chains. Recurses until fixpoint.
+"""
+function fold_static_branches!(items::Vector{<:ExprVarLine})
+    while _fold_static_vec!(items) end
+    items
+end
+
+function _fold_static_vec!(items::AbstractVector)
+    splices = Tuple{Int, Vector{Any}}[]
+    changed = false
+    for (i, item) in enumerate(items)
+        item isa Expr || continue
+        if item.head in (:if, :elseif) && item.args[1] isa Bool
+            push!(splices, (i, _take_branch(item)))
+            changed = true
+        else
+            changed |= _fold_static_vec!(item.args)
+        end
+    end
+    for (i, replacement) in reverse(splices)
+        splice!(items, i, replacement)
+    end
+    changed
+end
+
+function _take_branch(expr::Expr)
+    if expr.args[1]::Bool
+        body = expr.args[2]
+    elseif length(expr.args) >= 3
+        body = expr.args[3]
+        body isa Expr && body.head === :elseif && (body.head = :if)
+    else
+        return Any[]
+    end
+    body isa Expr && body.head === :block ?
+        filter(e -> !(e isa LineNumberNode), body.args) : Any[body]
 end
 
 function implement_casting!(expr::Expr, name::Symbol, finalsize::Int)
@@ -2298,12 +2492,15 @@ function implement_casting!(ctx::Base.ImmutableDict{Symbol, Any}, exprlikes::Vec
 end
 
 function defid_parsebytes(pexprs::Vector{ExprVarLine}, ctx::Base.ImmutableDict{Symbol, Any}, name::Symbol)
-    parsed_min = ctx[:parsed_bytes_min][]
-    resolved, elided = resolve_length_checks!(implement_casting!(ctx, pexprs), parsed_min)
-    # Split at __upfront_lengthcheck sentinel, replacing it with the actual check
+    registry = ctx[:branches]
+    parsed_min = registry[1].parsed_min  # root branch's cumulative min
+    resolved, _ = resolve_length_checks!(implement_casting!(ctx, pexprs), registry)
+    fold_static_branches!(resolved)
+    # Replace the root __branch_check sentinel with the upfront minimum-length check
     errmsg = defid_errmsg(ctx, string("Expected at least ", parsed_min, " bytes"))
-    split_idx = findfirst(e -> Meta.isexpr(e, :call) && first(e.args) === :__upfront_lengthcheck, resolved)
-    if !isnothing(split_idx) && elided
+    split_idx = findfirst(e -> Meta.isexpr(e, :call) && first(e.args) === :__branch_check &&
+                                e.args[2] == 1, resolved)
+    if !isnothing(split_idx) && parsed_min > 0
         check = if split_idx > 1
             :(nbytes - pos >= $(parsed_min - 1) || return ($errmsg, 1))
         else
@@ -2311,18 +2508,10 @@ function defid_parsebytes(pexprs::Vector{ExprVarLine}, ctx::Base.ImmutableDict{S
         end
         resolved[split_idx] = check
     else
-        # No leading skips or no elision — remove the sentinel
         !isnothing(split_idx) && deleteat!(resolved, split_idx)
-        if elided
-            pushfirst!(resolved, :(nbytes >= $parsed_min || return ($errmsg, 1)))
-        end
     end
     :(Base.@assume_effects :foldable :nothrow function $(GlobalRef(@__MODULE__, :parsebytes))(::Type{$(esc(name))}, idbytes::AbstractVector{UInt8})
-          parsed = $(if ctx[:bits][] <= 8
-                         :(Core.bitcast($(esc(ctx[:name])), 0x00))
-                     else
-                         :(Core.Intrinsics.zext_int($(esc(ctx[:name])), 0x0))
-                     end)
+          parsed = $(zero_parsed_expr(ctx, name))
           pos = 1
           nbytes = length(idbytes)
           $(resolved...)
@@ -2486,8 +2675,9 @@ function strip_segsets!(expr::ExprVarLine)
 end
 
 function defid_shortcode(pexprs::Vector{ExprVarLine}, ctx::Base.ImmutableDict{Symbol, Any}, name::Symbol)
-    maxbytes = ctx[:print_bytes_max][]
-    minbytes = ctx[:print_bytes_min][]
+    root = ctx[:current_branch]
+    maxbytes = root.print_max
+    minbytes = root.print_min
     fixedlen = minbytes == maxbytes
     # Build buffer-based expressions from the print expressions,
     # stripping __segment_printed assignments used only by segments()
@@ -2521,13 +2711,21 @@ function defid_shortcode(pexprs::Vector{ExprVarLine}, ctx::Base.ImmutableDict{Sy
     Expr(:block, tobytes_def, shortcode_io_def, shortcode_def)
 end
 
-function defid_properties(pexprs::Vector{Pair{Symbol, Vector{ExprVarLine}}}, ctx::Base.ImmutableDict{Symbol, Any}, name::Symbol)
-    isempty(pexprs) && return :()
-    # Build the if/elseif chain from the bottom up: innermost elseif first, outermost if last
+function defid_properties(properties::Vector{Pair{Symbol, Union{Symbol, Vector{ExprVarLine}}}},
+                          segs::Vector{IdValueSegment},
+                          ctx::Base.ImmutableDict{Symbol, Any}, name::Symbol)
+    isempty(properties) && return :()
+    resolved = resolve_property_segments(properties, segs)
     fallback = :(throw(FieldError($(esc(name)), prop)))
-    clauses = foldr(enumerate(pexprs), init = fallback) do (i, (prop, exprs)), rest
+    clauses = foldr(enumerate(properties), init = fallback) do (i, (prop, val)), rest
+        prop_exprs = if val isa Symbol
+            idx = only(resolved[i].second)
+            copy(segs[idx].extract)
+        else
+            copy(val)
+        end
         qprop = QuoteNode(prop)
-        body = Expr(:block, implement_casting!(ctx, exprs)...)
+        body = Expr(:block, implement_casting!(ctx, prop_exprs)...)
         Expr(ifelse(i == 1, :if, :elseif), :(prop === $qprop), body, rest)
     end
     :(function $(GlobalRef(Base, :getproperty))(id::$(esc(name)), prop::Symbol)
@@ -2535,23 +2733,23 @@ function defid_properties(pexprs::Vector{Pair{Symbol, Vector{ExprVarLine}}}, ctx
       end)
 end
 
-function defid_segments_type(ctx::Base.ImmutableDict{Symbol, Any}, name::Symbol)
-    segments = ctx[:segments]
-    isempty(segments) && return :()
+function defid_segments_type(segs::Vector{IdValueSegment}, name::Symbol)
+    isempty(segs) && return :()
     :(function $(GlobalRef(@__MODULE__, :segments))(::Type{$(esc(name))})
-          $(Expr(:tuple, [(; nbits, kind, label, desc) for (; nbits, kind, label, desc) in segments if nbits > 0]...))
+          $(Expr(:tuple, [(; nbits=s.nbits, kind=s.kind, label=s.label, desc=s.desc)
+                          for s in segs if s.nbits > 0]...))
       end)
 end
 
-function defid_segments_value(ctx::Base.ImmutableDict{Symbol, Any}, pexprs::Vector{ExprVarLine}, name::Symbol)
+function defid_segments_value(segs::Vector{IdValueSegment}, pexprs::Vector{ExprVarLine}, name::Symbol)
     function print_segsets!(segvars::Vector{Tuple{Int, Symbol}}, expr::ExprVarLine)
         expr isa Expr || return expr
         if Meta.isexpr(expr, :(=)) && first(expr.args) === :__segment_printed
             _, i = expr.args
             # We should never see i+1 before i
             if i > length(segvars)
-                anon = ctx[:segments][i].nbits == 0
-                precount = sum((s.nbits > 0 for s in ctx[:segments][1:i-1]), init = 0)
+                anon = segs[i].nbits == 0
+                precount = sum((s.nbits > 0 for s in segs[1:i-1]), init = 0)
                 push!(segvars, (ifelse(anon, 0, precount + 1), Symbol("seg$i")))
             end
             var = last(segvars[i])
@@ -2563,8 +2761,7 @@ function defid_segments_value(ctx::Base.ImmutableDict{Symbol, Any}, pexprs::Vect
         end
         expr
     end
-    segments = ctx[:segments]
-    isempty(segments) && return :()
+    isempty(segs) && return :()
     svars = Tuple{Int, Symbol}[]
     pexprs2 = map(copy, pexprs)
     for expr in pexprs2
@@ -2575,6 +2772,101 @@ function defid_segments_value(ctx::Base.ImmutableDict{Symbol, Any}, pexprs::Vect
           $(Expr(:(=), Expr(:tuple, (s for (_, s) in svars)...), Expr(:tuple, ("" for _ in svars)...)))
           $(pexprs2...)
           $(Expr(:tuple, (Expr(:tuple, i, s) for (i, s) in svars)...))
+      end)
+end
+
+function defid_constructor(segs::Vector{IdValueSegment},
+                          properties::Vector{Pair{Symbol, Union{Symbol, Vector{ExprVarLine}}}},
+                          ctx::Base.ImmutableDict{Symbol, Any}, name::Symbol)
+    resolved = resolve_property_segments(properties, segs)
+    isempty(resolved) && return :()
+    # Build (argname, seg_index) pairs: single-node uses property name, multi-node
+    # gets numbered sub-names
+    args = Tuple{Symbol, Int}[]
+    for (pname, idxs) in resolved
+        if length(idxs) == 1
+            push!(args, (pname, only(idxs)))
+        else
+            for (j, si) in enumerate(idxs)
+                push!(args, (Symbol(pname, "_", j), si))
+            end
+        end
+    end
+    isempty(args) && return :()
+    # Build parameter list and arg→segvar bindings
+    params = [let seg = segs[si]
+                  isnothing(seg.argtype) ? :($aname) : :($aname::$(seg.argtype))
+              end for (aname, si) in args]
+    argbindings = [:($(segs[si].argvar) = $aname) for (aname, si) in args]
+    # Validate optional scope nesting — derive scope_parents from branch registry
+    scope_parents = Dict{Symbol, Union{Nothing, Symbol}}()
+    for b in ctx[:branches]
+        isnothing(b.scope) && continue
+        scope_parents[b.scope] = isnothing(b.parent) ? nothing : b.parent.scope
+    end
+    scope_args = Dict{Symbol, Vector{Int}}()
+    for (idx, (_, si)) in enumerate(args)
+        scope = segs[si].condition
+        isnothing(scope) && continue
+        push!(get!(Vector{Int}, scope_args, scope), idx)
+    end
+    scope_checks = [:(if isnothing($(args[first(pidxs)][1])) && !isnothing($(args[first(cidxs)][1]))
+                          throw(ArgumentError(
+                              string("Cannot specify ", $(QuoteNode(args[first(cidxs)][1])),
+                                     " when ", $(QuoteNode(args[first(pidxs)][1])), " is nothing")))
+                      end)
+                    for (scope, cidxs) in scope_args
+                    for pidxs in (get(scope_args, get(scope_parents, scope, nothing), nothing),)
+                    if !isnothing(pidxs)]
+    # Build encode expressions from segment impart
+    encode_exprs = reduce(vcat, (segs[si].impart for (_, si) in args); init=Any[])
+    finalsize = cld(ctx[:bits][], 8)
+    for expr in encode_exprs
+        expr isa Expr && implement_casting!(expr, name, finalsize)
+    end
+    :(function $(esc(name))($(params...))
+          parsed = $(zero_parsed_expr(ctx, name))
+          $(argbindings...)
+          $(scope_checks...)
+          $(encode_exprs...)
+          parsed
+      end)
+end
+
+"""Generate `Base.show(io::IO, id::T)` displaying constructor form, e.g. `T(42, :A)`."""
+function defid_show(segs::Vector{IdValueSegment},
+                    properties::Vector{Pair{Symbol, Union{Symbol, Vector{ExprVarLine}}}},
+                    ctx::Base.ImmutableDict{Symbol, Any}, name::Symbol)
+    resolved = resolve_property_segments(properties, segs)
+    isempty(resolved) && return :()
+    # Build show body: each constructor arg separated by commas
+    show_parts = ExprVarLine[]
+    for (pname, idxs) in resolved
+        isempty(show_parts) || push!(show_parts, :(print(io, ", ")))
+        if length(idxs) == 1
+            push!(show_parts, :(show(io, getproperty(id, $(QuoteNode(pname))))))
+        else
+            for (j, si) in enumerate(idxs)
+                j > 1 && push!(show_parts, :(print(io, ", ")))
+                extract_copy = map(copy, segs[si].extract)
+                implement_casting!(ctx, extract_copy)
+                push!(show_parts, Expr(:block, extract_copy[1:end-1]...,
+                                       :(show(io, $(extract_copy[end])))))
+            end
+        end
+    end
+    :(function $(GlobalRef(Base, :show))(io::IO, id::$(esc(name)))
+          if get(io, :limit, false) === true
+              if get(io, :typeinfo, Nothing) != $(esc(name))
+                  print(io, $(QuoteNode(name)), ':')
+              end
+              print(io, shortcode(id))
+          else
+              show(io, $(esc(name)))
+              print(io, '(')
+              $(show_parts...)
+              print(io, ')')
+          end
       end)
 end
 
@@ -2590,9 +2882,11 @@ function defid_make(exprs::IdExprs, ctx::Base.ImmutableDict{Symbol, Any}, name::
           defid_parse(ctx, name)...,
           defid_shortcode(exprs.print, ctx, name),
           :($(GlobalRef(Base, :propertynames))(::$(esc(name))) = $(Tuple(map(first, exprs.properties)))),
-          defid_properties(exprs.properties, ctx, name),
-          defid_segments_type(ctx, name),
-          defid_segments_value(ctx, exprs.print, name),
+          defid_properties(exprs.properties, exprs.segments, ctx, name),
+          defid_segments_type(exprs.segments, name),
+          defid_segments_value(exprs.segments, exprs.print, name),
+          defid_constructor(exprs.segments, exprs.properties, ctx, name),
+          defid_show(exprs.segments, exprs.properties, ctx, name),
           :($(GlobalRef(Base, :isless))(a::$(esc(name)), b::$(esc(name))) =
                 Core.Intrinsics.ult_int(a, b)))
     if !isnothing(prefix)
