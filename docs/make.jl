@@ -19,7 +19,7 @@ Core.eval(FastIdentifiers,
         Throws [`MalformedIdentifier`](@ref) for invalid formats or [`ChecksumViolation`](@ref)
         for checksum validation failures.
 
-        This function uses the [`parseid`](@ref) implementation defined by each identifier type.
+        For `@defid` types, this is generated automatically from the pattern declaration.
         """
         Base.parse(::Type{<:AbstractIdentifier}, ::String) = nothing
 

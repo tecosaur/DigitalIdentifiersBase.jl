@@ -6,7 +6,7 @@ module FastIdentifiers
 export AbstractIdentifier, MalformedIdentifier, ChecksumViolation, shortcode, purl, @defid
 
 @static if VERSION >= v"1.11"
-    eval(Expr(:public, :idcode, :idchecksum, :purlprefix, :parseid, :parsefor, :lchopfolded, Symbol("@reexport")))
+    eval(Expr(:public, :idcode, :idchecksum, :purlprefix, Symbol("@reexport")))
 end
 
 """
@@ -33,7 +33,7 @@ macro reexport()
 end
 
 include("api.jl")
-include("utils.jl")
-include("defid.jl")
+include("defid/defid.jl")
+using .DefId: @defid
 
 end

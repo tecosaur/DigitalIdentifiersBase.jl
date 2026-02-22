@@ -3,7 +3,7 @@
 
 module PrettyPrintExt
 
-using FastIdentifiers: AbstractIdentifier, MalformedIdentifier, ChecksumViolation, purl, shortcode, lchopfolded
+using FastIdentifiers: AbstractIdentifier, MalformedIdentifier, ChecksumViolation, purl, shortcode
 
 using StyledStrings: @styled_str as @S_str
 
@@ -20,11 +20,10 @@ function Base.show(io::IO, ::MIME"text/plain", id::AbstractIdentifier)
     label = String(nameof(typeof(id)))
     lowerlabel = lowercase(label)
     url = purl(id)
-    idstr = SubString(shortcode(id))
-    _, idstr = if ':' in idstr
-        lchopfolded(idstr, lowerlabel * ':')
-    else
-        lchopfolded(idstr, lowerlabel)
+    idstr = shortcode(id)
+    prefix = if ':' in idstr; lowerlabel * ':' else lowerlabel end
+    if startswith(lowercase(idstr), prefix)
+        idstr = idstr[ncodeunits(prefix)+1:end]
     end
     if endswith(label, "ID")
         idstr = chopprefix(idstr, chopsuffix(label, "ID"))

@@ -10,11 +10,11 @@ It is expected that all identifiers have a plain text canonical form, and
 optionally a PURL (Persistent Uniform Resource Locator) that can be used to link
 to the resource. These may be one and the same.
 
-All subtypes of `AbstractIdentifier` must implement `parse` and `tryparse` methods.
-You can either implement [`parseid`](@ref) (recommended) or override the methods directly
-(see the extended help for a guide to implementing a new identifier type).
+All subtypes of `AbstractIdentifier` must implement `Base.parse` and `Base.tryparse`
+methods. Using [`@defid`](@ref) generates these automatically; hand-written types
+should override the methods directly.
 
-See also: [`shortcode`](@ref), [`purl`](@ref).
+See also: [`shortcode`](@ref), [`purl`](@ref), [`@defid`](@ref).
 
 # Extended help
 
@@ -30,106 +30,21 @@ interface for all of them.
 
 ## Implementation Guide
 
-All identifier types must implement `parse` and `tryparse` for converting
-strings to identifier objects. This can be conveniently done by just
-implementing [`parseid`](@ref).
+The recommended way to define identifier types is [`@defid`](@ref), which
+generates parsing, printing, and property access from a declarative pattern.
+
+For hand-written types, implement `Base.parse(::Type{T}, ::AbstractString)`
+and `Base.tryparse(::Type{T}, ::AbstractString)` directly.
 
 ### Optional Methods
 
-You may also implement:
-- [`shortcode`](@ref) for a minimally formatted representation
-- [`idcode`](@ref) for providing the number within a numeric identifier
-- [`idchecksum`](@ref) when the identifier includes/uses a checksum
-- [`purlprefix`](@ref) (or [`purl`](@ref)) for generating persistent URLs (PURLs)
-
-All methods but `idchecksum` and `purlprefix` have generic implementations.
-
-### Example identifier implementation
-
-Let's implement a simple numeric identifier called "MyId" that accepts the format
-`MyId:<number>` where `<number>` is between 0 and 65535. We want to support:
-- Parsing forms like `123`, `MyId:123` (case insensitive), and `https://example.com/123`
-- Providing permanent URLs
-- Automatic display formatting
-
-#### Basic implementation
-
-```julia
-struct MyIdentifier <: AbstractIdentifier
-    id::UInt16
-end
-
-FastIdentifiers.purlprefix(::Type{MyIdentifier}) = "https://example.com/"
-
-function FastIdentifiers.parseid(::Type{MyIdentifier}, input::SubString)
-    _, cleaned = lchopfolded(input, "myid:", "https://example.com/")
-    num = parsefor(MyIdentifier, UInt16, cleaned)
-    num isa UInt16 || return num  # Forward parse error
-    MyIdentifier(num)
-end
-```
-
-This minimal implementation uses the generic `idcode` and `shortcode` methods
-(returning `123` and `"123"` respectively), PURL generation
-("https://example.com/123"), and parsing support for multiple formats.
-
-#### Adding checksum validation
-
-Types that implement [`idchecksum`](@ref) automatically receive a `Type(id, checksum)`
-constructor that validates the computed checksum matches the provided value.
-
-```julia
-FastIdentifiers.idchecksum(id::MyIdentifier) =
-    sum(digits(id.id) .* (2 .^ (1:ndigits(id.id)) .- 1)) % 0xf
-
-# Defining `idchecksum` supports a generic `MyIdentifier(id, checksum)` constructor
-
-FastIdentifiers.shortcode(id::MyIdentifier) =
-    string(id.id) * string(idchecksum(id), base=16)
-
-function FastIdentifiers.parseid(::Type{MyIdentifier}, input::SubString)
-    _, cleaned = lchopfolded(input, "myid:", "https://example.com/")
-    digits_str, check_char = cleaned[1:end-1], cleaned[end]
-    num = parsefor(MyIdentifier, UInt16, digits_str)
-    num isa UInt16 || return num
-    check = parsefor(MyIdentifier, UInt8, check_char, base=16)
-    check isa UInt8 || return check
-    try MyIdentifier(num, check) catch e; e end
-end
-```
-
-This extended version performs checksum calculation, automatic validation via
-the `MyIdentifier(id, checksum)` constructor, and uses specific errors for
-malformed input and checksum violations.
-
-### Validation and errors
-
-`parseid(::Type{T}, input::SubString)` is a convenience function used by the generic
-`parse` and `tryparse` implementations. The function should accept multiple formats
-and return either a valid identifier or an exception object ([`MalformedIdentifier`](@ref)
-or [`ChecksumViolation`](@ref)).
-
-When parsing fails, your implementation should:
-- Return [`MalformedIdentifier`](@ref) for invalid formats
-- Return [`ChecksumViolation`](@ref) for checksum mismatches
-- Use [`parsefor`](@ref) helper for safe integer parsing
-
-### Method details
-
-**`parseid`** is the recommended way to implement parsing - the generic `parse`/`tryparse`
-methods will use it automatically.
-
-**`shortcode`** has a fallback implementation that uses [`idcode`](@ref) if available,
-or attempts to extract from single-field structs. For multi-field structs without
-`idcode`, you must implement this method to get meaningful output.
-
-**Numeric Identifiers**: If your identifier has a numeric component, consider implementing:
-- [`idcode`](@ref) enables automatic `shortcode` generation and comparison
-- [`idchecksum`](@ref) affects `idcode` behavior and enables checksum validation
-
-**URL Generation**: For identifiers with standard web URLs, implement either:
-- [`purlprefix`](@ref) when URL follows `prefix * shortcode` pattern
-- [`purl`](@ref) for custom URL schemes
+- [`shortcode`](@ref) — minimally formatted representation (has a default
+  for single-field numeric types via [`idcode`](@ref))
+- [`idcode`](@ref) — numeric component extraction; enables automatic
+  `shortcode` generation and comparison
+- [`idchecksum`](@ref) — checksum component; defining this auto-generates
+  a `T(id, checksum)` validating constructor
+- [`purlprefix`](@ref) (or [`purl`](@ref)) — persistent URL generation
 
 ## Invariants
 
@@ -141,49 +56,9 @@ All identifiers should ensure round-trip consistency:
 # See Also
 
 - [`MalformedIdentifier`](@ref), [`ChecksumViolation`](@ref): Exception types
-- [`parsefor`](@ref), [`lchopfolded`](@ref): Parsing utilities
 - [`@reexport`](@ref): Convenience macro for exporting the public-facing API
 """
 abstract type AbstractIdentifier end
-
-"""
-    parseid(::Type{T}, input::SubString) -> Union{T, Exception}
-
-Parse the `input` string as an identifier of type `T`.
-
-This function is used by the generic `parse` and `tryparse` functions and provides
-a convenient way to implement parsing. It should accept multiple input formats
-(shortcode, canonical, PURL) and return either a valid identifier or an exception object.
-
-Alternatively, you can implement `parse` and `tryparse` methods directly.
-
-# Example
-
-```julia
-function FastIdentifiers.parseid(::Type{MyID}, input::SubString)
-    _, cleaned = lchopfolded(input, "myid:", "https://example.com/")
-    num = parsefor(MyID, UInt16, cleaned)
-    num isa UInt16 || return num  # Return MalformedIdentifier on parse failure
-    MyID(num)
-end
-```
-
-See also:
-- [`parsefor`](@ref): Safe integer parsing helper
-- [`lchopfolded`](@ref): Case-insensitive prefix removal
-"""
-function parseid end
-
-function Base.parse(::Type{T}, input::AbstractString) where {T<:AbstractIdentifier}
-    id = @inline parseid(T, unsafe_substr(input))
-    id isa T || throw(id)
-    id
-end
-
-function Base.tryparse(::Type{T}, input::AbstractString) where {T<:AbstractIdentifier}
-    id = @inline parseid(T, unsafe_substr(input))
-    if id isa T id end
-end
 
 """
     MalformedIdentifier{T}(input, problem::String)
@@ -191,19 +66,6 @@ end
 Exception indicating that `input` is not a valid form of identifier type `T`.
 
 The `problem` string should describe what specifically makes the input invalid.
-This exception is typically returned by [`parseid`](@ref) implementations rather
-than thrown directly.
-
-# Example
-
-```julia
-function FastIdentifiers.parseid(::Type{MyID}, input::SubString)
-    if length(input) > 10
-        return MalformedIdentifier{MyID}(input, "must be 10 characters or fewer")
-    end
-    # ... continue parsing
-end
-```
 """
 struct MalformedIdentifier{T <: AbstractIdentifier, I} <: Exception
     input::I
@@ -393,3 +255,9 @@ function Base.isless(a::T, b::T) where {T <: AbstractIdentifier}
     (isnothing(ca) || isnothing(cb)) && return isless(shortcode(a), shortcode(b))
     ca < cb
 end
+
+# @defid machinery stubs — extended by generated methods
+function segments end
+function parsebytes end
+function tobytes end
+nbits(::Type{T}) where {T<:AbstractIdentifier} = 8 * sizeof(T)

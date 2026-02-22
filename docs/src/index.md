@@ -27,7 +27,4 @@ FastIdentifiers.purlprefix
 
 ```@docs
 FastIdentifiers.@reexport
-FastIdentifiers.parseid
-FastIdentifiers.parsefor
-FastIdentifiers.lchopfolded
 ```

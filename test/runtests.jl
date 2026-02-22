@@ -4,8 +4,7 @@
 using Test
 
 using FastIdentifiers: FastIdentifiers, AbstractIdentifier, MalformedIdentifier,
-    ChecksumViolation, shortcode, purl, idcode, idchecksum, purlprefix,
-    parseid, parsefor, lchopfolded
+    ChecksumViolation, shortcode, purl, idcode, idchecksum, purlprefix
 
 using StyledStrings, JSON, JSON3
 
@@ -33,18 +32,24 @@ function MyIdentifier(id::Integer, checksum::Integer)
     myid
 end
 
-function FastIdentifiers.parseid(::Type{MyIdentifier}, id::SubString)
-    _, id = lchopfolded(id, "myid:", "http://example.com/myid/")
-    str16..., checkchar = id
-    i16 = parsefor(MyIdentifier, UInt16, str16)
-    i16 isa UInt16 || return MalformedIdentifier{MyIdentifier}(id, "ID must be a valid UInt16")
-    check8 = parsefor(MyIdentifier, UInt8, checkchar, base=16)
-    check8 isa UInt8 || return MalformedIdentifier{MyIdentifier}(id, "Checksum must be a valid UInt8")
-    try
-        MyIdentifier(i16, check8)
-    catch e
-        e
+function Base.parse(::Type{MyIdentifier}, input::AbstractString)
+    id = SubString(input)
+    for prefix in ("myid:", "http://example.com/myid/")
+        if startswith(lowercase(id), prefix)
+            id = SubString(id, ncodeunits(prefix) + 1)
+        end
     end
+    str16, checkchar = id[1:end-1], id[end]
+    i16 = tryparse(UInt16, str16)
+    isnothing(i16) && throw(MalformedIdentifier{MyIdentifier}(input, "ID must be a valid UInt16"))
+    check8 = tryparse(UInt8, string(checkchar), base=16)
+    isnothing(check8) && throw(MalformedIdentifier{MyIdentifier}(input, "Checksum must be a valid UInt8"))
+    MyIdentifier(i16, check8)
+end
+
+function Base.tryparse(::Type{MyIdentifier}, input::AbstractString)
+    try parse(MyIdentifier, input)
+    catch nothing end
 end
 
 myid = MyIdentifier(1234, 0xc)
@@ -62,6 +67,7 @@ myid = MyIdentifier(1234, 0xc)
         @test tryparse(MyIdentifier, "12345X") === nothing
         @test_throws MalformedIdentifier{MyIdentifier} parse(MyIdentifier, "myid:12345X")
         @test_throws ChecksumViolation{MyIdentifier} parse(MyIdentifier, "myid:12340")
+        @test tryparse(MyIdentifier, "MyIX:1234c") === nothing  # last-byte prefix discrimination
     end
 end
 
