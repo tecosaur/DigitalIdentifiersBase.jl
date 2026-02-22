@@ -21,6 +21,7 @@ const IdValueSegment = @NamedTuple{
     kind::Symbol,                          # :digits, :choice, :letters, :alphnum, :hex, :charset, :literal, :skip
     label::Symbol,                         # attr_fieldname (inside field) or gensym (anonymous)
     desc::String,                          # human-readable description
+    shortform::String,                     # compact pattern notation for error messages
     argtype::Any,                          # :Integer, :Symbol, :AbstractString, or nothing (non-parameterisable)
     argvar::Symbol,                        # gensym used as parameter placeholder in impart
     extract::Vector{ExprVarLine},          # bits → typed value (last expr is the value)
@@ -151,7 +152,7 @@ end
 ## Segment and property assembly
 
 """
-    push_value_segment!(exprs::IdExprs; nbits, kind, fieldvar, desc,
+    push_value_segment!(exprs::IdExprs; nbits, kind, fieldvar, desc, shortform,
                         argvar, base_argtype, option,
                         extract_setup, extract_value,
                         present_check, impart_body)
@@ -166,6 +167,7 @@ use by `segments(id)`.
 """
 function push_value_segment!(exprs::IdExprs;
         nbits::Int, kind::Symbol, fieldvar::Symbol, desc::String,
+        shortform::String,
         argvar::Symbol, base_argtype::Any, option::Union{Nothing, Symbol},
         extract_setup::Vector{ExprVarLine}, extract_value::Any,
         present_check::Any, impart_body::Vector{Any})
@@ -182,7 +184,7 @@ function push_value_segment!(exprs::IdExprs;
     end
     label = Symbol(chopprefix(String(fieldvar), "attr_"))
     push!(exprs.segments, IdValueSegment((
-        nbits, kind, label, desc,
+        nbits, kind, label, desc, shortform,
         seg_argtype, argvar, seg_extract, seg_impart, option)))
     push!(exprs.print, :(__segment_printed = $(length(exprs.segments))))
 end
@@ -243,6 +245,69 @@ function defid_emit_extract(state::DefIdState, position::Int, width::Int,
                          nbits(fT) - width))
         :(Core.Intrinsics.and_int($ival, $fTmask))
     end
+end
+
+## Form string assembly
+
+"""
+    segments_formstring(segments, branches) -> String
+
+Join segment shortforms into a compact pattern notation like
+`"SN<0-9 × 4>[-<0-9 × 2>[-<0-9 × 1>]]"`, used in parse error messages
+to show the expected form. Optional segments are wrapped in square brackets,
+with proper nesting for nested optionals.
+"""
+function segments_formstring(segments::Vector{IdValueSegment}, branches::Vector{ParseBranch})
+    # Build scope→parent_scope mapping from branch tree
+    scope_parent = Dict{Symbol, Union{Nothing, Symbol}}()
+    for b in branches
+        isnothing(b.scope) && continue
+        scope_parent[b.scope] = isnothing(b.parent) ? nothing : b.parent.scope
+    end
+    io = IOBuffer()
+    scope_stack = Symbol[]  # stack of active optional scopes
+    for seg in segments
+        target = seg.condition
+        # Walk down from current scope to find the common ancestor with target
+        current = isempty(scope_stack) ? nothing : last(scope_stack)
+        if target !== current
+            # Build ancestor chain for target scope
+            target_chain = Symbol[]
+            s = target
+            while !isnothing(s)
+                push!(target_chain, s)
+                s = get(scope_parent, s, nothing)
+            end
+            reverse!(target_chain)
+            # Find how many levels of the current stack match
+            shared = 0
+            for i in 1:min(length(scope_stack), length(target_chain))
+                scope_stack[i] === target_chain[i] || break
+                shared = i
+            end
+            # Close scopes that are no longer active
+            for _ in shared+1:length(scope_stack)
+                print(io, ']')
+            end
+            resize!(scope_stack, shared)
+            # Open new scopes
+            for i in shared+1:length(target_chain)
+                print(io, '[')
+                push!(scope_stack, target_chain[i])
+            end
+        end
+        isempty(seg.shortform) && continue
+        if seg.kind in (:literal, :skip)
+            print(io, seg.shortform)
+        else
+            print(io, '<', seg.shortform, '>')
+        end
+    end
+    # Close all remaining open brackets
+    for _ in scope_stack
+        print(io, ']')
+    end
+    String(take!(io))
 end
 
 ## Optional sentinel helpers

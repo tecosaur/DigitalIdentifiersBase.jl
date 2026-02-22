@@ -52,7 +52,7 @@ function defid_literal!(exprs::IdExprs,
                  end).args)
     end
     push!(exprs.segments, IdValueSegment((0, :literal, :literal,
-          sprint(show, lit), nothing, :_, ExprVarLine[], Any[], option)))
+          sprint(show, lit), lit, nothing, :_, ExprVarLine[], Any[], option)))
     push!(exprs.print, :(print(io, $lit)), :(__segment_printed = $(length(exprs.segments))))
     inc_print!(nctx, litlen, litlen)
     inc_parsed!(nctx, litlen, litlen)
@@ -76,6 +76,7 @@ function defid_skip!(exprs::IdExprs,
     if !isnothing(pval)
         push!(exprs.segments, IdValueSegment((0, :skip, :skip,
               "Skipped literal string \"$(join(sargs, ", "))\"",
+              pval,
               nothing, :_, ExprVarLine[], Any[], get(nctx, :optional, nothing))))
         push!(exprs.print, :(print(io, $pval)), :(__segment_printed = $(length(exprs.segments))))
         inc_print!(nctx, ncodeunits(pval), ncodeunits(pval))

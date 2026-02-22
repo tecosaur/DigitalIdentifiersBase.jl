@@ -122,6 +122,7 @@ function choice_value!(exprs::IdExprs, state::DefIdState, nctx::NodeCtx, ctx)
     end
     push_value_segment!(exprs;
         nbits=choicebits, kind=:choice, fieldvar, desc=join(soptions, " | "),
+        shortform=join(soptions, " | "),
         argvar, base_argtype=:Symbol, option=eopt,
         extract_setup=ExprVarLine[fextract],
         extract_value, present_check=true,
@@ -143,6 +144,7 @@ function choice_fixed!(exprs::IdExprs, state::DefIdState, nctx::NodeCtx, ctx)
     push!(exprs.segments, IdValueSegment((0, :choice,
           Symbol(chopprefix(String(fieldvar), "attr_")),
           "Choice of literal string \"$(target)\" vs $(join(soptions, ", "))",
+          join(soptions, " | "),
           nothing, :_, ExprVarLine[], Any[], option)))
     push!(exprs.print, :(print(io, $target)), :(__segment_printed = $(length(exprs.segments))))
 end

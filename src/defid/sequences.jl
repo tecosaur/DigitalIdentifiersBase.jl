@@ -115,8 +115,14 @@ function defid_digits!(exprs::IdExprs,
     push!(body, :($fnum = $argvar % $dI))
     directvar || push!(body, encode_expr)
     push!(body, defid_emit_pack(state, dT, parsevar, nbits))
+    seg_shortform = let charset = if base <= 10; "0-$(Char('0' + base - 1))"
+                                   else "0-9A-$(Char('A' + base - 11))" end
+        count = if fixedwidth; "$maxdigits" else "$mindigits:$maxdigits" end
+        "$charset \u00d7 $count"
+    end
     push_value_segment!(exprs;
         nbits=dbits, kind=:digits, fieldvar, desc=seg_desc,
+        shortform=seg_shortform,
         argvar, base_argtype=:Integer, option,
         extract_setup=ExprVarLine[fextract], extract_value=propvalue,
         present_check=true, impart_body=body)
@@ -130,7 +136,8 @@ function parse_digit_range(args, max, base)
         lo <= hi || throw(ArgumentError("digits range min must be <= max"))
         (lo, hi)
     elseif !isempty(args) && first(args) isa Integer
-        (1, first(args))
+        n = first(args)
+        (n, n)
     elseif !isnothing(max)
         (1, ndigits(max, base=base))
     else
@@ -383,10 +390,15 @@ function defid_charseq_impl!(exprs::IdExprs,
           end)
     end
     charseq_body = filter(e -> !isnothing(e) && !(e isa LineNumberNode), encode_chars.args)
+    seg_shortform = let charset = join((string(Char(first(r)), '-', Char(last(r))) for r in ranges), "")
+        count = if variable; "$minlen:$maxlen" else "$maxlen" end
+        "$charset \u00d7 $count"
+    end
     push_value_segment!(exprs;
         nbits=totalbits, kind, fieldvar,
         desc=string(if variable; "$minlen-$maxlen" else "$maxlen" end,
                     " ", kind, if maxlen > 1; " characters" else " character" end),
+        shortform=seg_shortform,
         argvar, base_argtype=:AbstractString, option,
         extract_setup=extracts, extract_value=tostringex,
         present_check=true, impart_body=charseq_body)
@@ -454,7 +466,7 @@ function defid_embed!(exprs::IdExprs,
     end
     push_value_segment!(exprs;
         nbits=ebits + presbits, kind=:embed, fieldvar,
-        desc="embedded $(T)",
+        desc="embedded $(T)", shortform=string(T),
         argvar, base_argtype=T, option,
         extract_setup=ExprVarLine[fextract], extract_value=fieldvar,
         present_check=true, impart_body=body)

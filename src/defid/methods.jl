@@ -31,7 +31,7 @@ function defid_make(exprs::IdExprs, state::DefIdState, name::Symbol)
           :($(GlobalRef(FastIdentifiers, :nbits))(::Type{$(esc(name))}) = $(state.bits)),
           :($(GlobalRef(FastIdentifiers, :parsebounds))(::Type{$(esc(name))}) = $((root.parsed_min, root.parsed_max))),
           :($(GlobalRef(FastIdentifiers, :printbounds))(::Type{$(esc(name))}) = $((root.print_min, root.print_max))),
-          defid_parsebytes(exprs.parse, state, name),
+          defid_parsebytes(exprs.parse, exprs.segments, state, name),
           defid_parse(state, name)...,
           defid_shortcode(exprs.print, state, name),
           :($(GlobalRef(Base, :propertynames))(::$(esc(name))) = $(Tuple(map(first, exprs.properties)))),
@@ -70,7 +70,8 @@ end
 
 ## parsebytes / parse / tryparse
 
-function defid_parsebytes(pexprs::Vector{ExprVarLine}, state::DefIdState, name::Symbol)
+function defid_parsebytes(pexprs::Vector{ExprVarLine}, segments::Vector{IdValueSegment},
+                          state::DefIdState, name::Symbol)
     parsed_min = state.branches[1].parsed_min
     resolved = resolve_length_checks!(implement_casting!(state, pexprs), state.branches)
     fold_static_branches!(resolved)
@@ -83,7 +84,10 @@ function defid_parsebytes(pexprs::Vector{ExprVarLine}, state::DefIdState, name::
         resolved[gate_idx] = :($ok_sym || return (parsed, -$checkpos_sym))
     end
     # Replace the root __branch_check sentinel with an upfront minimum-length check
-    errmsg = defid_errmsg(state, string("Expected at least ", parsed_min, " bytes"))
+    formstr = segments_formstring(segments, state.branches)
+    errmsg = defid_errmsg(state, string(
+        "Expected at least ", parsed_min, " bytes",
+        isempty(formstr) ? "" : string(", must match the form '", formstr, "'")))
     split_idx = findfirst(resolved) do e
         Meta.isexpr(e, :call) && first(e.args) === :__branch_check && e.args[2] == 1
     end
@@ -338,7 +342,7 @@ end
 function defid_segments_type(segs::Vector{IdValueSegment}, name::Symbol)
     isempty(segs) && return :()
     :(function $(GlobalRef(FastIdentifiers, :segments))(::Type{$(esc(name))})
-          $(Expr(:tuple, [(; nbits=s.nbits, kind=s.kind, label=s.label, desc=s.desc)
+          $(Expr(:tuple, [(; nbits=s.nbits, kind=s.kind, label=s.label, desc=s.desc, shortform=s.shortform)
                           for s in segs if s.nbits > 0]...))
       end)
 end
