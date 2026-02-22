@@ -29,6 +29,8 @@ function defid_make(exprs::IdExprs, state::DefIdState, name::Symbol)
     push!(block.args,
           :(Base.@__doc__(primitive type $(esc(name)) <: $AbstractIdentifier $numbits end)),
           :($(GlobalRef(FastIdentifiers, :nbits))(::Type{$(esc(name))}) = $(state.bits)),
+          :($(GlobalRef(FastIdentifiers, :parsebounds))(::Type{$(esc(name))}) = $((root.parsed_min, root.parsed_max))),
+          :($(GlobalRef(FastIdentifiers, :printbounds))(::Type{$(esc(name))}) = $((root.print_min, root.print_max))),
           defid_parsebytes(exprs.parse, state, name),
           defid_parse(state, name)...,
           defid_shortcode(exprs.print, state, name),
@@ -385,6 +387,12 @@ function rewrite_bufprint!(pexprs::Union{Vector{<:ExprVarLine}, Vector{Any}})
                 rewrite_print_call(args)
             elseif fname == :printchars
                 Any[:(pos = bufprintchars(buf, pos, $(args...)))]
+            elseif fname == :shortcode
+                ebuf = gensym("ebuf")
+                elen = gensym("elen")
+                Any[:(($ebuf, $elen) = tobytes($(args...))),
+                    :(Base.unsafe_copyto!(pointer(buf, pos + 1), pointer($ebuf), $elen)),
+                    :(pos += $elen)]
             end
             push!(splices, (i, replacement))
         elseif expr isa Expr

@@ -196,6 +196,14 @@ end
 
 ## Bit packing
 
+function zero_int(@nospecialize(T::DataType))
+    if sizeof(T) == 1
+        Core.bitcast(T, 0x00)
+    else
+        Core.Intrinsics.zext_int(T, 0x0)
+    end
+end
+
 zero_parsed_expr(state::DefIdState) =
     if state.bits <= 8
         :(Core.bitcast($(esc(state.name)), 0x00))
@@ -203,19 +211,25 @@ zero_parsed_expr(state::DefIdState) =
         :(Core.Intrinsics.zext_int($(esc(state.name)), 0x0))
     end
 
-function defid_emit_pack(state::DefIdState, type::Type, value::Union{Symbol, Expr}, shift::Int)
+function defid_emit_pack(state::DefIdState, type::Type, value::Union{Symbol, Expr, Bool}, shift::Int)
     valcast = Expr(:call, :__cast_to_id, type, value)
     :(parsed = Core.Intrinsics.or_int(parsed, Core.Intrinsics.shl_int($valcast, (8 * sizeof($(esc(state.name))) - $shift))))
 end
 
-function defid_emit_extract(state::DefIdState, position::Int, width::Int)
-    fT = cardtype(width)
+function defid_emit_extract(state::DefIdState, position::Int, width::Int,
+                            fT::Type=cardtype(width))
     fval = :(Core.Intrinsics.lshr_int(id, 8 * sizeof($(esc(state.name))) - $position))
     ival = Expr(:call, :__cast_from_id, fT, fval)
-    if width == sizeof(fT) * 8
+    if width == nbits(fT)
         ival
-    else
+    elseif fT === cardtype(width)
         fTmask = ~(typemax(fT) << width)
         :($ival & $fTmask)
+    else
+        fTmask = Core.Intrinsics.not_int(
+                     Core.Intrinsics.shl_int(
+                         Core.Intrinsics.not_int(zero_int(fT)),
+                         nbits(fT) - width))
+        :(Core.Intrinsics.and_int($ival, $fTmask))
     end
 end

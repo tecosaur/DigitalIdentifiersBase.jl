@@ -260,4 +260,6 @@ end
 function segments end
 function parsebytes end
 function tobytes end
-nbits(::Type{T}) where {T<:AbstractIdentifier} = 8 * sizeof(T)
+function parsebounds end
+function printbounds end
+nbits(@nospecialize(T::DataType)) = 8 * sizeof(T)

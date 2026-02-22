@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: © 2025 TEC <contact@tecosaur.net>
 # SPDX-License-Identifier: MPL-2.0
 
-# Pattern handlers for value-carrying sequences: digits and character sequences
-# (letters, alphnum). These emit parse/print expressions, bit-packing, and
-# constructor impart code for numeric and character fields.
+# Pattern handlers for value-carrying sequences: digits, character sequences
+# (letters, alphnum), and embedded identifier types. These emit parse/print
+# expressions, bit-packing, and constructor impart code.
 
 ## Digits
 
@@ -318,4 +318,71 @@ function charseq_config(nctx, kind)
     letters = if lower && !upper; (az,) elseif singlecase; (AZ,) else (AZ, az) end
     ranges = if kind === :letters; letters else (d09, letters...) end
     (ranges, casefold)
+end
+
+## Embedded identifier types
+
+function defid_embed!(exprs::IdExprs,
+                      state::DefIdState, nctx::NodeCtx,
+                      args::Vector{Any})
+    length(args) == 1 || throw(ArgumentError("embed takes exactly one argument (the identifier type)"))
+    T = Core.eval(state.mod, args[1])
+    T isa DataType && T <: AbstractIdentifier && isprimitivetype(T) ||
+        throw(ArgumentError("embed type must be a primitive AbstractIdentifier subtype, got $T"))
+    ebits = nbits(T)
+    epad = 8 * sizeof(T) - ebits  # MSB padding bits in the embedded type
+    option = get(nctx, :optional, nothing)
+    presbits = isnothing(option) ? 0 : 1
+    fieldvar = get(nctx, :fieldvar, gensym("embed"))
+    nbits_pos = (state.bits += ebits + presbits)
+    inc_parsed!(nctx, parsebounds(T)...)
+    inc_print!(nctx, printbounds(T)...)
+    # @defid types pack from the MSB, so embedded values must be shifted
+    # right by epad before packing (MSB→LSB) and left after extracting (LSB→MSB)
+    to_lsb(val) = :(Core.Intrinsics.lshr_int($val, $epad))
+    to_msb(val) = :(Core.Intrinsics.shl_int($val, $epad))
+    # Parse: delegate to inner parsebytes
+    eresult = Symbol("$(fieldvar)_result")
+    epos = Symbol("$(fieldvar)_epos")
+    errmsg = defid_errmsg(state, "Invalid embedded $(T)")
+    notfound = if isnothing(option)
+        [:(return ($errmsg, pos))]
+    else
+        [:($option = false)]
+    end
+    eshifted = Symbol("$(fieldvar)_shifted")
+    pack = defid_emit_pack(state, T, eshifted, nbits_pos - presbits)
+    push!(exprs.parse,
+          :(($eresult, $epos) = parsebytes($T, @view idbytes[pos:end])),
+          :(if !($eresult isa $T); $(notfound...) end),
+          :($eshifted = $(to_lsb(eresult))))
+    if isnothing(option)
+        push!(exprs.parse, pack, :(pos += $epos - 1))
+    else
+        push!(exprs.parse,
+              :(if $option; $pack; $(defid_emit_pack(state, Bool, option, nbits_pos)); pos += $epos - 1 end))
+    end
+    # Extract + print
+    fextract = :($fieldvar = $(to_msb(defid_emit_extract(state, nbits_pos - presbits, ebits, T))))
+    present = if presbits > 0
+        :(!iszero($(defid_emit_extract(state, nbits_pos, presbits))))
+    else
+        true
+    end
+    emit_print_detect!(exprs, nctx, option, ExprVarLine[fextract], present)
+    push!(exprs.print, :(shortcode(io, $fieldvar)))
+    # Constructor impart
+    argvar = gensym("arg_embed")
+    argshifted = gensym("arg_embed_shifted")
+    body = Any[:($argshifted = $(to_lsb(argvar))),
+               defid_emit_pack(state, T, argshifted, nbits_pos - presbits)]
+    if presbits > 0
+        push!(body, defid_emit_pack(state, Bool, true, nbits_pos))
+    end
+    push_value_segment!(exprs;
+        nbits=ebits + presbits, kind=:embed, fieldvar,
+        desc="embedded $(T)",
+        argvar, base_argtype=T, option,
+        extract_setup=ExprVarLine[fextract], extract_value=fieldvar,
+        present_check=present, impart_body=body)
 end

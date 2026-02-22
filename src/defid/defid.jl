@@ -4,7 +4,8 @@
 module DefId
 
 using FastIdentifiers: FastIdentifiers, AbstractIdentifier, MalformedIdentifier,
-    shortcode, purlprefix, segments, nbits, parsebytes, tobytes
+    shortcode, purlprefix, segments, nbits, parsebytes, tobytes,
+    parsebounds, printbounds
 
 include("utils.jl")
 include("core.jl")
@@ -32,6 +33,7 @@ Available constructs:
 - `literal(str)`: required literal string
 - `digits([n | min:max], [base=10, min=0, max=base^digits-1, pad=0])`: digit field
 - `letters([n | min:max])`, `alphnum([n | min:max])`: character sequences
+- `embed(Type)`: embed another `@defid` primitive type
 
 Use `:field(pattern)` to capture a sub-pattern as a named property.
 

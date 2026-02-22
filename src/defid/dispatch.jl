@@ -31,6 +31,8 @@ function defid_dispatch!(exprs::IdExprs,
         defid_charseq!(exprs, state, nctx, args, :letters)
     elseif node === :alphnum
         defid_charseq!(exprs, state, nctx, args, :alphnum)
+    elseif node === :embed
+        defid_embed!(exprs, state, nctx, args)
     else
         throw(ArgumentError("Unknown pattern node $node"))
     end
