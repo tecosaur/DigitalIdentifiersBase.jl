@@ -44,37 +44,39 @@ julia> (id.id, id.version, id.participants)
 ```
 """
 macro defid(name, pattern, args...)
-    ctx = Base.ImmutableDict{Symbol, Any}(:name, name)
-    ctx = Base.ImmutableDict{Symbol, Any}(ctx, :bits, Ref(0))
-    root = ParseBranch(1, nothing, nothing, 0, 0, 0, 0, 0)
-    ctx = Base.ImmutableDict{Symbol, Any}(ctx, :branches, ParseBranch[root])
-    ctx = Base.ImmutableDict{Symbol, Any}(ctx, :current_branch, root)
-    ctx = Base.ImmutableDict{Symbol, Any}(ctx, :casefold, true)
-    ctx = Base.ImmutableDict{Symbol, Any}(ctx, :errconsts, String[])
-    ctx = Base.ImmutableDict{Symbol, Any}(ctx, :__module__, __module__)
+    casefold_val = true
+    prefix_val = nothing
     for arg in args
         Meta.isexpr(arg, :(=), 2) || throw(ArgumentError("Expected keyword arguments of the form key=value, got $arg"))
         kwname, kwval = arg.args
         kwname ∈ ALL_KNOWN_KEYS ||
             throw(ArgumentError("Unknown keyword argument $kwname. Known keyword arguments are: $(join(ALL_KNOWN_KEYS, ", "))"))
-        ctx = Base.ImmutableDict{Symbol, Any}(ctx, kwname, kwval)
+        kwname === :casefold && (casefold_val = kwval)
+        kwname === :purlprefix && (prefix_val = kwval)
     end
+    root = ParseBranch(1, nothing, nothing, 0, 0, 0, 0, 0)
+    state = DefIdState(name, __module__, 0, casefold_val, prefix_val, ParseBranch[root], String[])
+    nctx = NodeCtx(:current_branch, root)
     exprs = IdExprs(([], [], [], []))
     # Strip PURL prefix before the main pattern
-    prefix = get(ctx, :purlprefix, nothing)
-    if !isnothing(prefix)
-        defid_dispatch!(exprs, ctx, Expr(:call, :skip, lowercase(prefix)))
+    if !isnothing(prefix_val)
+        defid_dispatch!(exprs, state, nctx, Expr(:call, :skip, lowercase(prefix_val)))
     end
-    defid_dispatch!(exprs, ctx, :__first_nonskip)
-    defid_dispatch!(exprs, ctx, pattern)
-    defid_make(exprs, ctx, name)
+    defid_dispatch!(exprs, state, nctx, :__first_nonskip)
+    defid_dispatch!(exprs, state, nctx, pattern)
+    defid_make(exprs, state, name)
 end
 
 @static if VERSION < v"1.13-"
     takestring!(io::IO) = String(take!(io))
 end
 
+# -----------------------------------------------------------
+# Types, constants, and helpers
+# -----------------------------------------------------------
+
 const ExprVarLine = Union{Expr, Symbol, LineNumberNode}
+const NodeCtx = Base.ImmutableDict{Symbol, Any}
 # Unified segment: each value-carrying pattern node pushes one of these
 const IdValueSegment = @NamedTuple{
     nbits::Int,                            # bits consumed in packed representation
@@ -106,10 +108,21 @@ mutable struct ParseBranch
     print_max::Int                             # cumulative max output bytes produced
 end
 
-inc_parsed!(ctx, dmin, dmax) =
-    let b = ctx[:current_branch]; b.parsed_min += dmin; b.parsed_max += dmax end
-inc_print!(ctx, dmin, dmax) =
-    let b = ctx[:current_branch]; b.print_min += dmin; b.print_max += dmax end
+"""Global mutable state for @defid macro expansion, separating from scoped NodeCtx."""
+mutable struct DefIdState
+    const name::Symbol
+    const mod::Module
+    bits::Int
+    const casefold::Bool
+    const purlprefix::Union{Nothing, String}
+    const branches::Vector{ParseBranch}
+    const errconsts::Vector{String}
+end
+
+inc_parsed!(nctx::NodeCtx, dmin, dmax) =
+    let b = nctx[:current_branch]; b.parsed_min += dmin; b.parsed_max += dmax end
+inc_print!(nctx::NodeCtx, dmin, dmax) =
+    let b = nctx[:current_branch]; b.print_min += dmin; b.print_max += dmax end
 
 """Resolve `__branch_check(Bool, id)`: `true` when zero-content or parent subsumes, else runtime check."""
 function resolve_branch_check(b::ParseBranch)
@@ -135,11 +148,11 @@ wrap_optional_impart(argvar::Symbol, body) =
 seg_label(fieldvar::Symbol) = Symbol(chopprefix(String(fieldvar), "attr_"))
 
 """Generate the zero-initialized `parsed` expression for the packed identifier."""
-zero_parsed_expr(ctx, name) =
-    if ctx[:bits][] <= 8
-        :(Core.bitcast($(esc(name)), 0x00))
+zero_parsed_expr(state::DefIdState) =
+    if state.bits <= 8
+        :(Core.bitcast($(esc(state.name)), 0x00))
     else
-        :(Core.Intrinsics.zext_int($(esc(name)), 0x0))
+        :(Core.Intrinsics.zext_int($(esc(state.name)), 0x0))
     end
 
 """
@@ -195,45 +208,48 @@ end
 swar_type(nd::Int) = nd <= 1 ? UInt8 : nd <= 2 ? UInt16 : nd <= 4 ? UInt32 : UInt64
 
 """Register a compile-time error message and return its 1-based index for use as an error code."""
-function defid_errmsg(ctx::Base.ImmutableDict{Symbol, Any}, msg::String)
-    errmsgs = ctx[:errconsts]
-    push!(errmsgs, msg)
-    length(errmsgs)
+function defid_errmsg(state::DefIdState, msg::String)
+    push!(state.errconsts, msg)
+    length(state.errconsts)
 end
 
+# -----------------------------------------------------------
+# Pattern dispatch
+# -----------------------------------------------------------
+
 function defid_dispatch!(exprs::IdExprs,
-                         ctx::Base.ImmutableDict{Symbol, Any},
+                         state::DefIdState, nctx::NodeCtx,
                          node::Any, args::Vector{Any})
     if node isa QuoteNode
-        defid_field!(exprs, ctx, node, args)
+        defid_field!(exprs, state, nctx, node, args)
     elseif node === :seq
         for arg in args
-            defid_dispatch!(exprs, ctx, arg)
+            defid_dispatch!(exprs, state, nctx, arg)
         end
     elseif node === :optional
-        defid_optional!(exprs, ctx, args)
+        defid_optional!(exprs, state, nctx, args)
     elseif node === :skip
-        defid_skip!(exprs, ctx, args)
+        defid_skip!(exprs, state, nctx, args)
     elseif node === :choice
-        defid_choice!(exprs, ctx, args)
+        defid_choice!(exprs, state, nctx, args)
     elseif node === :literal
         length(args) == 1 || throw(ArgumentError("Expected exactly one argument for literal, got $(length(args))"))
         lit = args[1]
         lit isa String || throw(ArgumentError("Expected a string literal for literal, got $lit"))
-        defid_literal!(exprs, ctx, lit)
+        defid_literal!(exprs, state, nctx, lit)
     elseif node === :digits
-        defid_digits!(exprs, ctx, args)
+        defid_digits!(exprs, state, nctx, args)
     elseif node === :letters
-        defid_charseq!(exprs, ctx, args, :letters)
+        defid_charseq!(exprs, state, nctx, args, :letters)
     elseif node === :alphnum
-        defid_charseq!(exprs, ctx, args, :alphnum)
+        defid_charseq!(exprs, state, nctx, args, :alphnum)
     else
         throw(ArgumentError("Unknown pattern node $node"))
     end
 end
 
 function defid_dispatch!(exprs::IdExprs,
-                         ctx::Base.ImmutableDict{Symbol, Any},
+                         state::DefIdState, nctx::NodeCtx,
                          thing::Any)
     if Meta.isexpr(thing, :tuple)
         args = Any[]
@@ -242,12 +258,12 @@ function defid_dispatch!(exprs::IdExprs,
                 kwname, kwval = arg.args
                 kwname ∈ ALL_KNOWN_KEYS ||
                     throw(ArgumentError("Unknown keyword argument $kwname. Known keyword arguments are: $(join(ALL_KNOWN_KEYS, ", "))"))
-                ctx = Base.ImmutableDict{Symbol, Any}(ctx, kwname, kwval)
+                nctx = NodeCtx(nctx, kwname, kwval)
             else
                 push!(args, arg)
             end
         end
-        defid_dispatch!(exprs, ctx, :seq, args)
+        defid_dispatch!(exprs, state, nctx, :seq, args)
     elseif Meta.isexpr(thing, :call)
         name = first(thing.args)
         args = Any[]
@@ -261,32 +277,36 @@ function defid_dispatch!(exprs::IdExprs,
                 kwname, kwval = arg.args
                 kwname ∈ nkeys ||
                     throw(ArgumentError("Unknown keyword argument $kwname. Known keyword arguments for $name are: $(join(nkeys, ", "))"))
-                ctx = Base.ImmutableDict{Symbol, Any}(ctx, kwname, kwval)
+                nctx = NodeCtx(nctx, kwname, kwval)
             else
                 push!(args, arg)
             end
         end
-        defid_dispatch!(exprs, ctx, name, args)
+        defid_dispatch!(exprs, state, nctx, name, args)
     elseif thing isa String
-        defid_literal!(exprs, ctx, thing)
+        defid_literal!(exprs, state, nctx, thing)
     elseif thing === :__first_nonskip
-        root = ctx[:current_branch]
+        root = nctx[:current_branch]
         root.parsed_min = 0
         root.parsed_max = 0
         push!(exprs.parse, Expr(:call, :__branch_check, root.id, nothing))
     end
 end
 
+# -----------------------------------------------------------
+# Pattern handlers: field, optional, skip
+# -----------------------------------------------------------
+
 function defid_field!(exprs::IdExprs,
-                      ctx::Base.ImmutableDict{Symbol, Any},
+                      state::DefIdState, nctx::NodeCtx,
                       node::QuoteNode,
                       args::Vector{Any})
-    isnothing(get(ctx, :fieldvar, nothing)) || throw(ArgumentError("Fields may not be nested"))
-    ctx = Base.ImmutableDict{Symbol, Any}(ctx, :fieldvar, Symbol("attr_$(node.value)"))
+    isnothing(get(nctx, :fieldvar, nothing)) || throw(ArgumentError("Fields may not be nested"))
+    nctx = NodeCtx(nctx, :fieldvar, Symbol("attr_$(node.value)"))
     initial_segs = length(exprs.segments)
     initialprints = length(exprs.print)
     for arg in args
-        defid_dispatch!(exprs, ctx, arg)
+        defid_dispatch!(exprs, state, nctx, arg)
     end
     # Count new value-carrying segments (those with argtype !== nothing)
     new_value_segs = filter(s -> !isnothing(s.argtype), @view exprs.segments[initial_segs+1:end])
@@ -308,30 +328,30 @@ function defid_field!(exprs::IdExprs,
 end
 
 function defid_optional!(exprs::IdExprs,
-                         ctx::Base.ImmutableDict{Symbol, Any},
+                         state::DefIdState, nctx::NodeCtx,
                          args::Vector{Any})
-    popt = get(ctx, :optional, nothing)
-    ctx = Base.ImmutableDict{Symbol, Any}(ctx, :optional, gensym("optional"))
-    ctx = Base.ImmutableDict{Symbol, Any}(ctx, :oprint_detect, ExprVarLine[])
+    popt = get(nctx, :optional, nothing)
+    nctx = NodeCtx(nctx, :optional, gensym("optional"))
+    nctx = NodeCtx(nctx, :oprint_detect, ExprVarLine[])
     # Fork a child branch for this optional scope
-    parent = ctx[:current_branch]
-    child = ParseBranch(length(ctx[:branches]) + 1, parent, ctx[:optional],
+    parent = nctx[:current_branch]
+    child = ParseBranch(length(state.branches) + 1, parent, nctx[:optional],
                         parent.parsed_min, parent.parsed_min, parent.parsed_max,
                         parent.print_min, parent.print_max)
-    push!(ctx[:branches], child)
-    ctx = Base.ImmutableDict{Symbol, Any}(ctx, :current_branch, child)
+    push!(state.branches, child)
+    nctx = NodeCtx(nctx, :current_branch, child)
     oexprs = (; parse = ExprVarLine[], print = ExprVarLine[], segments = exprs.segments, properties = exprs.properties)
     if all(a -> a isa String, args)
-        defid_choice!(oexprs, ctx, push!(Any[join(Vector{String}(args))], ""))
+        defid_choice!(oexprs, state, nctx, push!(Any[join(Vector{String}(args))], ""))
     else
         for arg in args
-            defid_dispatch!(oexprs, ctx, arg)
+            defid_dispatch!(oexprs, state, nctx, arg)
         end
     end
     # Merge max back to parent; min stays unchanged (optional content doesn't raise the guarantee)
     parent.parsed_max = Base.max(parent.parsed_max, child.parsed_max)
     parent.print_max = Base.max(parent.print_max, child.print_max)
-    optvar = ctx[:optional]
+    optvar = nctx[:optional]
     # Rewind pos when the optional has multiple nodes: an early node may advance
     # pos before a later node fails and sets option=false. Not needed when the
     # all-strings path converted to a choice (single-node handling).
@@ -345,33 +365,37 @@ function defid_optional!(exprs::IdExprs,
     push!(exprs.parse, :($optvar = $guard))
     push!(exprs.parse, :(if $optvar; $(oexprs.parse...) end))
     needs_rewind && push!(exprs.parse, :($optvar || (pos = $savedpos)))
-    append!(exprs.print, ctx[:oprint_detect])
-    push!(exprs.print, :(if $(ctx[:optional]); $(oexprs.print...) end))
+    append!(exprs.print, nctx[:oprint_detect])
+    push!(exprs.print, :(if $(nctx[:optional]); $(oexprs.print...) end))
     nothing
 end
 
 function defid_skip!(exprs::IdExprs,
-                     ctx::Base.ImmutableDict{Symbol, Any},
+                     state::DefIdState, nctx::NodeCtx,
                      args::Vector{Any})
     all(a -> a isa String, args) || throw(ArgumentError("Expected all arguments to be strings for skip"))
-    pval = get(ctx, :print, nothing)
+    pval = get(nctx, :print, nothing)
     sargs = Vector{String}(args)
     !isnothing(pval) && pval ∉ sargs && push!(sargs, pval)
-    casefold = get(ctx, :casefold, true) === true
+    casefold = get(nctx, :casefold, state.casefold) === true
     if casefold
         all(isascii, sargs) || throw(ArgumentError("Expected all arguments to be ASCII strings for skip with casefolding"))
     end
     push!(exprs.parse, gen_static_lchop(casefold ? map(lowercase, sargs) : sargs, casefold=casefold))
-    inc_parsed!(ctx, 0, maximum(ncodeunits, sargs))
+    inc_parsed!(nctx, 0, maximum(ncodeunits, sargs))
     if !isnothing(pval)
         push!(exprs.segments, nullsegment(nbits=0, kind=:skip, label=:skip,
               desc="Skipped literal string \"$(join(sargs, ", "))\"",
-              condition=get(ctx, :optional, nothing)))
+              condition=get(nctx, :optional, nothing)))
         push!(exprs.print, :(print(io, $pval)), :(__segment_printed = $(length(exprs.segments))))
-        inc_print!(ctx, ncodeunits(pval), ncodeunits(pval))
+        inc_print!(nctx, ncodeunits(pval), ncodeunits(pval))
     end
     nothing
 end
+
+# -----------------------------------------------------------
+# Choice: perfect hashing and verification
+# -----------------------------------------------------------
 
 """
     find_perfect_hash(options::Vector{String}, casefold::Bool)
@@ -526,16 +550,9 @@ function gen_verify_table(options::Vector{String}, casefold::Bool;
         vcat(left, right)
     end
     masks = Tuple(
-        reduce(|, (begin
-            valid = c.offset + j < minlen
-            byte_mask = if valid
-                casefold && any(opt -> codeunit(opt, c.offset + j + 1) in UInt8('a'):UInt8('z'), options) ?
-                    c.iT(0xDF) : c.iT(0xFF)
-            else
-                zero(c.iT)
-            end
-            byte_mask << (8j)
-        end for j in 0:c.width-1), init=zero(c.iT))
+        build_chunk_mask(c.iT, c.width,
+            j -> c.offset + j < minlen,
+            j -> casefold && any(opt -> codeunit(opt, c.offset + j + 1) in UInt8('a'):UInt8('z'), options))
         for c in chunks)
     verify_table = Tuple(
         Tuple(pack_bytes(opt, c.offset, min(c.width, max(0, minlen - c.offset)), c.iT) & m
@@ -545,7 +562,7 @@ function gen_verify_table(options::Vector{String}, casefold::Bool;
 end
 
 """
-    gen_verify_exprs(vt, prefix::Symbol) -> (destructure, checks)
+    gen_verify_exprs(vt, prefix::Symbol; pos_offset=0) -> (destructure, checks)
 
 Generate AST for destructured comparison of word-sized chunks.
 
@@ -554,7 +571,7 @@ Returns:
 - `destructure`: assignments that extract per-option expected values from the verify table
 - `checks`: a boolean expression that is `true` when all chunks match
 """
-function gen_verify_exprs(vt, prefix::Symbol)
+function gen_verify_exprs(vt, prefix::Symbol; pos_offset::Int = 0)
     nchunks = length(vt.chunks)
     cvars = [Symbol(prefix, "_expect", ci) for ci in 1:nchunks]
     mvars = [Symbol(prefix, "_mask", ci) for ci in 1:nchunks]
@@ -562,15 +579,9 @@ function gen_verify_exprs(vt, prefix::Symbol)
         Expr(:(=), Expr(:tuple, cvars...), :($(vt.verify_table)[i])),
         Expr(:(=), Expr(:tuple, mvars...), vt.masks)]
     checks = foldr(1:nchunks, init = :(true)) do ci, rest
-        (; offset, width, iT) = vt.chunks[ci]
-        posexpr = iszero(offset) ? :pos : :(pos + $offset)
-        load = load_word(iT, posexpr)
-        m = vt.masks[ci]
-        check = if m == typemax(iT)
-            :($load == $(cvars[ci]))
-        else
-            :($load & $(mvars[ci]) == $(cvars[ci]))
-        end
+        baseoff = vt.chunks[ci].offset + pos_offset
+        posexpr = iszero(baseoff) ? :pos : :(pos + $baseoff)
+        check = masked_load_check(vt.chunks[ci].iT, vt.masks[ci], cvars[ci], posexpr)
         rest == :(true) ? check : :($check && $rest)
     end
     (; destructure, checks)
@@ -589,22 +600,17 @@ function gen_tail_verify(options::Vector{String}, minoptlen::Int, casefold::Bool
     has_empty = any(iszero, taillens)
     distinct_taillens = unique(filter(!iszero, taillens))
     body = if length(distinct_taillens) == 1
-        # Single tail length: word-sized comparison with & mask convention
+        # Single tail length: word-sized comparison via gen_verify_exprs
         taillen = only(distinct_taillens)
         chunks = word_chunks(taillen)
         nonempty_tails = filter(!isempty, tails)
         masks = Tuple(
-            reduce(|, (begin
-                byte_mask = if casefold && any(t -> codeunit(t, c.offset + j + 1) in UInt8('a'):UInt8('z'), nonempty_tails)
-                    c.iT(0xDF)
-                else
-                    c.iT(0xFF)
-                end
-                byte_mask << (8j)
-            end for j in 0:c.width-1), init=zero(c.iT))
+            build_chunk_mask(c.iT, c.width,
+                _ -> true,
+                j -> casefold && any(t -> codeunit(t, c.offset + j + 1) in UInt8('a'):UInt8('z'), nonempty_tails))
             for c in chunks)
         zerotup = Tuple(zero(c.iT) for c in chunks)
-        tailtable = Tuple(
+        verify_table = Tuple(
             if isempty(tails[oi])
                 zerotup
             else
@@ -612,24 +618,9 @@ function gen_tail_verify(options::Vector{String}, minoptlen::Int, casefold::Bool
                       for (c, m) in zip(chunks, masks))
             end
             for oi in eachindex(options))
-        tvars = [Symbol(prefix, "_tail", ci) for ci in 1:length(chunks)]
-        tmvars = [Symbol(prefix, "_tmask", ci) for ci in 1:length(chunks)]
-        destructure = [
-            Expr(:(=), Expr(:tuple, tvars...), :($tailtable[i])),
-            Expr(:(=), Expr(:tuple, tmvars...), masks)]
-        checks = foldr(1:length(chunks), init = :(true)) do ci, rest
-            (; offset, width, iT) = chunks[ci]
-            posexpr = :(pos + $(minoptlen + offset))
-            load = load_word(iT, posexpr)
-            m = masks[ci]
-            check = if m == typemax(iT)
-                :($load == $(tvars[ci]))
-            else
-                :($load & $(tmvars[ci]) == $(tvars[ci]))
-            end
-            rest == :(true) ? check : :($check && $rest)
-        end
-        ExprVarLine[destructure..., :(found = $checks)]
+        vt = (; verify_table, masks, chunks)
+        tve = gen_verify_exprs(vt, Symbol(prefix, "_tail"); pos_offset = minoptlen)
+        ExprVarLine[tve.destructure..., :(found = $(tve.checks))]
     else
         # Multiple tail lengths: codeunit loop over tail bytes
         tailtable = Tuple(Tuple(codeunits(t)) for t in tails)
@@ -658,16 +649,16 @@ function gen_tail_verify(options::Vector{String}, minoptlen::Int, casefold::Bool
 end
 
 function defid_choice!(exprs::IdExprs,
-                       ctx::Base.ImmutableDict{Symbol, Any},
+                       state::DefIdState, nctx::NodeCtx,
                        options::Vector{Any})
     all(o -> o isa String, options) || throw(ArgumentError("Expected all options to be strings for choice"))
     soptions = Vector{String}(options)
     allowempty = any(isempty, soptions)
     allowempty && filter!(!isempty, soptions)
-    casefold = get(ctx, :casefold, true)
-    target = get(ctx, :is, nothing)::Union{Nothing, String}
-    fieldvar = get(ctx, :fieldvar, gensym("prefix"))
-    option = get(ctx, :optional, nothing)
+    casefold = get(nctx, :casefold, state.casefold)
+    target = get(nctx, :is, nothing)::Union{Nothing, String}
+    fieldvar = get(nctx, :fieldvar, gensym("prefix"))
+    option = get(nctx, :optional, nothing)
     choicebits = cardbits(length(soptions) + !isnothing(option))
     choiceint = if isnothing(target)
         cardtype(choicebits)
@@ -734,43 +725,42 @@ function defid_choice!(exprs::IdExprs,
                           end),
                         :(found = !iszero(i))]
         end
-        # Collect matcher expressions, skipping absent optional parts
+        # Collect matcher expressions: resolve_i then a single guarded block
         parts = ExprVarLine[resolve_i...]
+        verify_body = ExprVarLine[]
         if variable_len
-            optlencheck = defid_lengthcheck(ctx, :optlen, minoptlen, maximum(ncodeunits, matchoptions))
-            push!(parts,
-                  :(if found
-                        optlen = $(optlens)[i]
-                        found = $optlencheck
-                    end))
+            optlencheck = defid_lengthcheck(state, nctx, :optlen, minoptlen, maximum(ncodeunits, matchoptions))
+            append!(verify_body,
+                    ExprVarLine[:(optlen = $(optlens)[i]),
+                                :(found = $optlencheck)])
         end
         if !isempty(vt.chunks)
             ve = gen_verify_exprs(vt, fieldvar)
-            verify_block = Expr(:block, ve.destructure..., :(found = $(ve.checks)))
-            if use_wide_vt
+            verify_stmts = if use_wide_vt
                 ve_wide = gen_verify_exprs(vt_wide, fieldvar)
                 wide_block = Expr(:block, ve_wide.destructure..., :(found = $(ve_wide.checks)))
-                chosen = Expr(:if, defid_static_lengthcheck(ctx, wide_minlen),
-                              wide_block, verify_block)
-                push!(parts,
-                      :(if found
-                            $chosen
-                        end))
+                verify_block = Expr(:block, ve.destructure..., :(found = $(ve.checks)))
+                ExprVarLine[Expr(:if, defid_static_lengthcheck(state, nctx, wide_minlen),
+                                 wide_block, verify_block)]
             else
-                push!(parts,
-                      :(if found
-                            $(verify_block.args...)
-                        end))
+                ExprVarLine[ve.destructure..., :(found = $(ve.checks))]
+            end
+            # Wrap in found guard only when there are prior stages that may have cleared it
+            if !isempty(verify_body)
+                push!(verify_body, :(if found; $(verify_stmts...) end))
+            else
+                append!(verify_body, verify_stmts)
             end
         end
         if variable_len
-            push!(parts, tailcheck)
+            push!(verify_body, tailcheck)
         end
-        push!(parts,
+        push!(verify_body,
               :(if found
                     pos += $(if variable_len; :optlen else minoptlen end)
                     $foundaction
                 end))
+        push!(parts, :(if found; $(verify_body...) end))
         parts
     else # Linear scan fallback
         opts = casefold ? matchoptions : soptions
@@ -793,13 +783,13 @@ function defid_choice!(exprs::IdExprs,
           end)]
     end
     notfound = if isnothing(option)
-        errsym = defid_errmsg(ctx, "Expected one of $(join(soptions, ", "))")
+        errsym = defid_errmsg(state, "Expected one of $(join(soptions, ", "))")
         :(return ($errsym, pos))
     else
         :($option = false)
     end
     minoptbytes = minimum(ncodeunits, soptions)
-    lencheck = defid_lengthcheck(ctx, minoptbytes)
+    lencheck = defid_lengthcheck(state, nctx, minoptbytes)
     checkedmatch = if allowempty
         :(if $lencheck
               $(matcher...)
@@ -818,18 +808,18 @@ function defid_choice!(exprs::IdExprs,
           end)
     end
     if isnothing(target)
-        nbits = (ctx[:bits][] += choicebits)
-        inc_print!(ctx, minimum(ncodeunits, soptions), maximum(ncodeunits, soptions))
-        inc_parsed!(ctx, minimum(ncodeunits, soptions), maximum(ncodeunits, soptions))
+        nbits = (state.bits += choicebits)
+        inc_print!(nctx, minimum(ncodeunits, soptions), maximum(ncodeunits, soptions))
+        inc_parsed!(nctx, minimum(ncodeunits, soptions), maximum(ncodeunits, soptions))
         push!(exprs.parse,
               :($fieldvar = zero($choiceint)),
               checkedmatch,
-              defid_orshift(ctx, choiceint, fieldvar, nbits))
-        fextract = :($fieldvar = $(defid_fextract(ctx, nbits, choicebits)))
+              defid_orshift(state, choiceint, fieldvar, nbits))
+        fextract = :($fieldvar = $(defid_fextract(state, nbits, choicebits)))
         if isnothing(option)
             push!(exprs.print, fextract)
         else
-            push!(ctx[:oprint_detect], fextract, :($option = !iszero($fieldvar)))
+            push!(nctx[:oprint_detect], fextract, :($option = !iszero($fieldvar)))
         end
         # Build extract and impart for the segment
         symoptions = Tuple(Symbol.(soptions))
@@ -838,7 +828,7 @@ function defid_choice!(exprs::IdExprs,
         else
             ExprVarLine[fextract, :(if !iszero($fieldvar) @inbounds $(symoptions)[$fieldvar] end)]
         end
-        # Constructor impart: validate Symbol → 1-based index → pack
+        # Constructor impart: validate Symbol -> 1-based index -> pack
         argvar = gensym("arg_choice")
         seg_impart = Any[]
         impart_core = Any[
@@ -847,7 +837,7 @@ function defid_choice!(exprs::IdExprs,
                       string("Invalid option :", $argvar, "; expected one of: ", $(join(soptions, ", ")))))
                   idx % $choiceint
               end),
-            defid_orshift(ctx, choiceint, fieldvar, nbits)]
+            defid_orshift(state, choiceint, fieldvar, nbits)]
         if isnothing(option)
             append!(seg_impart, impart_core)
             seg_argtype = :Symbol
@@ -870,8 +860,8 @@ function defid_choice!(exprs::IdExprs,
                   :($fieldvar = zero($choiceint)),
                   checkedmatch)
         end
-        inc_print!(ctx, ncodeunits(target), ncodeunits(target))
-        inc_parsed!(ctx, minimum(ncodeunits, soptions), maximum(ncodeunits, soptions))
+        inc_print!(nctx, ncodeunits(target), ncodeunits(target))
+        inc_parsed!(nctx, minimum(ncodeunits, soptions), maximum(ncodeunits, soptions))
         push!(exprs.segments, nullsegment(nbits=0, kind=:choice,
               label=seg_label(fieldvar),
               desc="Choice of literal string \"$(target)\" vs $(join(soptions, ", "))",
@@ -881,6 +871,10 @@ function defid_choice!(exprs::IdExprs,
     nothing
 end
 
+
+# -----------------------------------------------------------
+# Word-sized operations and string comparison
+# -----------------------------------------------------------
 
 """Generate an expression to load a value of type `iT` from `idbytes` at `posexpr`."""
 function load_word(iT::DataType, posexpr::Union{Symbol, Expr})
@@ -909,6 +903,24 @@ function word_chunks(nbytes::Int)
         nb -= bw
     end
     chunks
+end
+
+"""Build a per-byte OR-mask for a word-sized chunk: `0xFF` (exact), `0xDF` (casefold alpha), or `0x00` (invalid)."""
+function build_chunk_mask(iT::DataType, width::Int, is_valid, is_casefold_alpha)
+    reduce(|, (begin
+        byte_mask = if is_valid(j)
+            is_casefold_alpha(j) ? iT(0xDF) : iT(0xFF)
+        else
+            zero(iT)
+        end
+        byte_mask << (8j)
+    end for j in 0:width-1), init=zero(iT))
+end
+
+"""Build the AST for `load_word(iT, posexpr) & mask == expected`, eliding the mask when all-ones."""
+function masked_load_check(iT::DataType, mask, expected, posexpr)
+    load = load_word(iT, posexpr)
+    mask == typemax(iT) ? :($load == $expected) : :($load & $mask == $expected)
 end
 
 """
@@ -963,24 +975,12 @@ function gen_static_stringcomp(str::String, casefold::Bool, nbytes::Int = ncodeu
     strlen = ncodeunits(str)
     map(word_chunks(nbytes)) do (; offset, width, iT)
         valid = min(width, strlen - offset)
-        # Per-byte mask: 0xDF for casefolded alpha, 0xFF for exact, 0x00 for overflow
-        mask = reduce(|, (begin
-            byte_mask = if j < valid
-                casefold && codeunit(str, offset + j + 1) in UInt8('a'):UInt8('z') ?
-                    iT(0xDF) : iT(0xFF)
-            else
-                zero(iT)
-            end
-            byte_mask << (8j)
-        end for j in 0:width-1), init=zero(iT))
+        mask = build_chunk_mask(iT, width,
+            j -> j < valid,
+            j -> casefold && codeunit(str, offset + j + 1) in UInt8('a'):UInt8('z'))
         value = pack_bytes(str, offset, valid, iT) & mask
         posexpr = iszero(offset) ? :pos : :(pos + $offset)
-        load = load_word(iT, posexpr)
-        if mask == typemax(iT)
-            :($load == $value)
-        else
-            :($load & $mask == $value)
-        end
+        masked_load_check(iT, mask, value, posexpr)
     end
 end
 
@@ -1023,17 +1023,21 @@ function gen_static_lchop(prefixes::Vector{String}; casefold::Bool)
     result
 end
 
+# -----------------------------------------------------------
+# Pattern handlers: literal, digits, letters/alphnum
+# -----------------------------------------------------------
+
 function defid_literal!(exprs::IdExprs,
-                        ctx::Base.ImmutableDict{Symbol, Any},
+                        state::DefIdState, nctx::NodeCtx,
                         lit::String)
-    option = get(ctx, :optional, nothing)
+    option = get(nctx, :optional, nothing)
     notfound = if isnothing(option)
-        errsym = defid_errmsg(ctx, "Expected literal '$(lit)'")
+        errsym = defid_errmsg(state, "Expected literal '$(lit)'")
         :(return ($errsym, pos))
     else
         :($option = false)
     end
-    casefold = get(ctx, :casefold, true) === true
+    casefold = get(nctx, :casefold, state.casefold) === true
     if casefold
         all(isascii, lit) || throw(ArgumentError("Expected ASCII string for literal with casefolding"))
     end
@@ -1048,12 +1052,12 @@ function defid_literal!(exprs::IdExprs,
         wide_mm = :(!($(foldl((a, b) -> :($a && $b), wide_checks))))
         narrow_checks = gen_static_stringcomp(litref, casefold)
         narrow_mm = :(!($(foldl((a, b) -> :($a && $b), narrow_checks))))
-        Expr(:if, defid_static_lengthcheck(ctx, wide_n), wide_mm, narrow_mm)
+        Expr(:if, defid_static_lengthcheck(state, nctx, wide_n), wide_mm, narrow_mm)
     else
         checks = gen_static_stringcomp(litref, casefold)
         :(!($(foldl((a, b) -> :($a && $b), checks))))
     end
-    lencheck = defid_lengthcheck(ctx, litlen)
+    lencheck = defid_lengthcheck(state, nctx, litlen)
     if isnothing(option)
         push!(exprs.parse,
               :(if !$lencheck
@@ -1082,10 +1086,14 @@ function defid_literal!(exprs::IdExprs,
     push!(exprs.segments, nullsegment(nbits=0, kind=:literal, label=:literal,
           desc=sprint(show, lit), condition=option))
     push!(exprs.print, :(print(io, $lit)), :(__segment_printed = $(length(exprs.segments))))
-    inc_print!(ctx, litlen, litlen)
-    inc_parsed!(ctx, litlen, litlen)
+    inc_print!(nctx, litlen, litlen)
+    inc_parsed!(nctx, litlen, litlen)
     nothing
 end
+
+# -----------------------------------------------------------
+# SWAR digit parsing
+# -----------------------------------------------------------
 
 """
     swarparse_consts(::Type{T}, base::Int, ndigits::Int)
@@ -1490,7 +1498,7 @@ helpers. Bundles symbols, encoding expressions, range checks, and error messages
 """
 function compute_digit_vocab(fieldvar::Symbol, option,
                              dspec::NamedTuple,
-                             ctx::Base.ImmutableDict{Symbol, Any})
+                             state::DefIdState)
     (; base, mindigits, maxdigits, min, max, pad, dI, dT) = dspec
     fixedwidth = mindigits == maxdigits
     fnum = Symbol("$(fieldvar)_num")
@@ -1511,15 +1519,15 @@ function compute_digit_vocab(fieldvar::Symbol, option,
     rangecheck = if min == 0 && max == base^maxdigits - 1
         :()
     else
-        maxerr = defid_errmsg(ctx, "Expected at most a value of $(string(max; base, pad))")
-        minerr = defid_errmsg(ctx, "Expected at least a value of $(string(min; base, pad))")
+        maxerr = defid_errmsg(state, "Expected at most a value of $(string(max; base, pad))")
+        minerr = defid_errmsg(state, "Expected at least a value of $(string(min; base, pad))")
         maxcheck = :($fnum <= $max || return ($maxerr, pos))
         mincheck = :($fnum >= $min || return ($minerr, pos))
         if min == 0; maxcheck
         elseif max == base^maxdigits - 1; mincheck
         else :($mincheck; $maxcheck) end
     end
-    errmsg = defid_errmsg(ctx, if fixedwidth && maxdigits > 1
+    errmsg = defid_errmsg(state, if fixedwidth && maxdigits > 1
         "exactly $maxdigits digits in base $base"
     elseif mindigits > 1
         "$mindigits to $maxdigits digits in base $base"
@@ -1606,12 +1614,12 @@ end
 Scalar `parseint` fallback for digit fields where SWAR isn't applicable.
 """
 function gen_digit_parseint(vocab, dspec::NamedTuple,
-                            ctx::Base.ImmutableDict{Symbol, Any})
+                            state::DefIdState, nctx::NodeCtx)
     (; fnum, fail_expr, option) = vocab
     (; base, mindigits, maxdigits) = dspec
     fixedwidth = mindigits == maxdigits
     bitsconsumed = Symbol("$(vocab.fieldvar)_bitsconsumed")
-    scanlimit = defid_lengthbound(ctx, maxdigits)
+    scanlimit = defid_lengthbound(state, nctx, maxdigits)
     matchcond = if fixedwidth
         :($bitsconsumed == $maxdigits)
     elseif mindigits > 1
@@ -1637,13 +1645,13 @@ required/optional branching that every fixed-width path needs.
 `check_fn(on_fail) -> Vector{ExprVarLine}` produces check expressions that
 evaluate `on_fail` when the digit check fails.
 """
-function gen_digit_fixed_guarded(vocab, ctx::Base.ImmutableDict{Symbol, Any},
+function gen_digit_fixed_guarded(vocab, state::DefIdState, nctx::NodeCtx,
                                  nd::Int,
                                  load_exprs::Vector{ExprVarLine},
                                  check_fn,
                                  parse_and_encode::Vector{ExprVarLine})
     (; fail_expr, option, errmsg) = vocab
-    b = ctx[:current_branch]
+    b = nctx[:current_branch]
     if isnothing(option)
         nd_guard = :(if !($(Expr(:call, :__length_check, b.id, b.parsed_max, nd, nd, nd)))
                          return ($errmsg, pos)
@@ -1679,13 +1687,13 @@ Load strategy (best to worst):
 3. Exact — decompose maxdigits into power-of-2 sub-loads, shift and OR
 """
 function gen_digit_swar_fixed(vocab, dspec::NamedTuple,
-                              ctx::Base.ImmutableDict{Symbol, Any})
+                              state::DefIdState, nctx::NodeCtx)
     (; fnum) = vocab
     (; base, maxdigits, dI) = dspec
     sT = swar_type(maxdigits)
     swar_var = Symbol("$(vocab.fieldvar)_swar")
     # Backward load when enough preceding bytes provide padding
-    b = ctx[:current_branch]
+    b = nctx[:current_branch]
     backward = b.parsed_min >= sizeof(sT) - maxdigits
     # Forward overread: when maxdigits < sizeof(sT) and backward isn't available,
     # a full-width forward load + left-shift is cheaper than exact sub-loads.
@@ -1696,7 +1704,7 @@ function gen_digit_swar_fixed(vocab, dspec::NamedTuple,
         shift = 8 * (sizeof(sT) - maxdigits)
         wide_load = :($swar_var = htol(Base.unsafe_load(Ptr{$sT}(pointer(idbytes, pos)))) << $shift)
         narrow_load = gen_swar_load(sT, swar_var, maxdigits; backward=false)
-        Expr(:if, defid_static_lengthcheck(ctx, sizeof(sT)), wide_load, narrow_load)
+        Expr(:if, defid_static_lengthcheck(state, nctx, sizeof(sT)), wide_load, narrow_load)
     else
         gen_swar_load(sT, swar_var, maxdigits; backward)
     end
@@ -1704,7 +1712,7 @@ function gen_digit_swar_fixed(vocab, dspec::NamedTuple,
     # gen_swarparse is a no-op for nd==1 (just `&= 0x0F`), skip it
     parse_expr = maxdigits == 1 ? ExprVarLine[] : gen_swarparse(sT, swar_var, base, maxdigits)
     swar_cast = sT == dI ? :($fnum = $swar_var) : :($fnum = $swar_var % $dI)
-    gen_digit_fixed_guarded(vocab, ctx, maxdigits,
+    gen_digit_fixed_guarded(vocab, state, nctx, maxdigits,
                             ExprVarLine[load], check_fn,
                             ExprVarLine[parse_expr..., swar_cast])
 end
@@ -1716,7 +1724,7 @@ Two-chunk SWAR for fixed-width fields with 9-16 digits: split into an 8-digit
 upper chunk and a (maxdigits-8)-digit lower chunk.
 """
 function gen_digit_twochunk(vocab, dspec::NamedTuple,
-                            ctx::Base.ImmutableDict{Symbol, Any})
+                            state::DefIdState, nctx::NodeCtx)
     (; fnum, fieldvar) = vocab
     (; base, maxdigits, dI) = dspec
     upper_nd = sizeof(UInt)  # 8
@@ -1743,7 +1751,7 @@ function gen_digit_twochunk(vocab, dspec::NamedTuple,
     _, lower_parse = gen_swar_chunk(lower_sT, lower_var, lower_nd, base, nothing)
     scale = UInt64(base) ^ lower_nd
     combine = :($fnum = ($(upper_var) * $scale + $(lower_var) % UInt64) % $dI)
-    gen_digit_fixed_guarded(vocab, ctx, maxdigits, load_exprs, check_fn,
+    gen_digit_fixed_guarded(vocab, state, nctx, maxdigits, load_exprs, check_fn,
                             ExprVarLine[upper_parse..., lower_parse..., combine])
 end
 
@@ -1764,7 +1772,7 @@ When `avail` or shifts resolve to compile-time constants, LLVM eliminates
 the runtime-dependent operations entirely.
 """
 function gen_digit_swar_variable(vocab, dspec::NamedTuple,
-                                 ctx::Base.ImmutableDict{Symbol, Any})
+                                 state::DefIdState, nctx::NodeCtx)
     (; fnum, fail_expr, option, fieldvar) = vocab
     (; base, mindigits, maxdigits, dI) = dspec
     sT = swar_type(Base.min(maxdigits, sizeof(UInt)))
@@ -1781,10 +1789,10 @@ function gen_digit_swar_variable(vocab, dspec::NamedTuple,
     # Backward-load: single load with runtime-variable position, branchless digit count.
     # Requires sizeof(sT) - 1 preceding bytes (worst case: avail=1, load reaches back
     # sizeof(sT) - 1 bytes). Most identifiers with a literal prefix qualify.
-    b = ctx[:current_branch]
+    b = nctx[:current_branch]
     backward = b.parsed_min >= sizeof(sT) - 1
     availvar = Symbol("$(fieldvar)_avail")
-    avail_bound = defid_lengthbound(ctx, maxdigits)
+    avail_bound = defid_lengthbound(state, nctx, maxdigits)
     load_and_count = if backward
         # Load sizeof(sT) bytes ending at pos + avail - 1, then right-shift to
         # low-align the digit window. gen_swar_digitcount counts from the LSB.
@@ -1836,7 +1844,7 @@ function gen_digit_swar_variable(vocab, dspec::NamedTuple,
         # Emit both paths; __static_length_check + fold_static_branches! picks the winner
         wide = Expr(:block, fwd_guarded...)
         narrow = Expr(:block, cascade...)
-        ExprVarLine[Expr(:if, defid_static_lengthcheck(ctx, sizeof(sT)), wide, narrow)]
+        ExprVarLine[Expr(:if, defid_static_lengthcheck(state, nctx, sizeof(sT)), wide, narrow)]
     end
     if isnothing(option)
         swar_core = ExprVarLine[load_and_count...,
@@ -1864,37 +1872,37 @@ symbol holding the encoded value for `defid_orshift`) and `directvar` (whether
 `dspec` is a NamedTuple with: `base`, `mindigits`, `maxdigits`, `min`, `max`,
 `pad`, `dI` (value integer type), `dT` (stored/encoded type).
 """
-function gen_digit_parse(ctx::Base.ImmutableDict{Symbol, Any},
+function gen_digit_parse(state::DefIdState, nctx::NodeCtx,
                          fieldvar::Symbol, option,
                          dspec::NamedTuple)
-    vocab = compute_digit_vocab(fieldvar, option, dspec, ctx)
+    vocab = compute_digit_vocab(fieldvar, option, dspec, state)
     (; mindigits, maxdigits, base) = dspec
     fixedwidth = mindigits == maxdigits
     swar_limit = fixedwidth ? 2 * sizeof(UInt) : sizeof(UInt)
     use_swar = base <= 16 && maxdigits <= swar_limit
     exprs = if !use_swar
-        gen_digit_parseint(vocab, dspec, ctx)
+        gen_digit_parseint(vocab, dspec, state, nctx)
     elseif !fixedwidth
-        gen_digit_swar_variable(vocab, dspec, ctx)
+        gen_digit_swar_variable(vocab, dspec, state, nctx)
     elseif maxdigits > sizeof(UInt)
-        gen_digit_twochunk(vocab, dspec, ctx)
+        gen_digit_twochunk(vocab, dspec, state, nctx)
     else
-        gen_digit_swar_fixed(vocab, dspec, ctx)
+        gen_digit_swar_fixed(vocab, dspec, state, nctx)
     end
     (; exprs, vocab.parsevar, vocab.directvar)
 end
 
 function defid_digits!(exprs::IdExprs,
-                       ctx::Base.ImmutableDict{Symbol, Any},
+                       state::DefIdState, nctx::NodeCtx,
                        args::Vector{Any})
     length(args) ∈ (0, 1) || throw(ArgumentError("Expected at most one positional argument for digits, got $(length(args))"))
-    base = get(ctx, :base, 10)::Int
-    min = get(ctx, :min, 0)::Int
-    max = get(ctx, :max, nothing)
+    base = get(nctx, :base, 10)::Int
+    min = get(nctx, :min, 0)::Int
+    max = get(nctx, :max, nothing)
     if max isa Expr
-        max = Core.eval(ctx[:__module__], max)::Int
+        max = Core.eval(state.mod, max)::Int
     end
-    pad = get(ctx, :pad, 0)::Int
+    pad = get(nctx, :pad, 0)::Int
     # Positional arg: integer n → digits(1:n), range lo:hi → digits(lo:hi)
     mindigits, maxdigits = if !isempty(args) && Meta.isexpr(first(args), :call, 3) && first(first(args).args) == :(:)
         lo, hi = first(args).args[2], first(args).args[3]
@@ -1913,23 +1921,23 @@ function defid_digits!(exprs::IdExprs,
     if isnothing(max)
         max = (base^maxdigits) - 1
     end
-    option = get(ctx, :optional, nothing)
+    option = get(nctx, :optional, nothing)
     range = max - min + 1 + !isnothing(option)
     # Store raw values when it fits in the same bits as offset encoding
     directval = cardbits(range) == cardbits(max) && (min > 0 || isnothing(option))
     dbits = sizeof(typeof(range)) * 8 - leading_zeros(range)
     dI = cardtype(8 * sizeof(typeof(max)) - leading_zeros(max))
     dT = cardtype(dbits)
-    fieldvar = get(ctx, :fieldvar, gensym("digits"))
-    nbits = (ctx[:bits][] += dbits)
+    fieldvar = get(nctx, :fieldvar, gensym("digits"))
+    nbits = (state.bits += dbits)
     fixedpad = ifelse(fixedwidth, maxdigits, 0)
     printmin = Base.max(ndigits(Base.max(min, 1); base), pad, fixedpad)
     printmax = Base.max(ndigits(max; base), pad, fixedpad)
-    # gen_digit_parse reads ctx[:parsed_bytes_*] for SWAR safety, so call before updating
+    # gen_digit_parse reads parsed_min for SWAR safety, so call before updating
     dspec = (; base, mindigits, maxdigits, min, max, pad, dI, dT)
-    parsed = gen_digit_parse(ctx, fieldvar, option, dspec)
-    inc_print!(ctx, printmin, printmax)
-    inc_parsed!(ctx, mindigits, maxdigits)
+    parsed = gen_digit_parse(state, nctx, fieldvar, option, dspec)
+    inc_print!(nctx, printmin, printmax)
+    inc_parsed!(nctx, mindigits, maxdigits)
     fnum = Symbol("$(fieldvar)_num")
     bitsconsumed = Symbol("$(fieldvar)_bitsconsumed")
     (; parsevar, directvar) = parsed
@@ -1940,9 +1948,9 @@ function defid_digits!(exprs::IdExprs,
     else
         :(if $option; pos += $posadv end)
     end
-    push!(exprs.parse, defid_orshift(ctx, dT, parsevar, nbits), posexpr)
+    push!(exprs.parse, defid_orshift(state, dT, parsevar, nbits), posexpr)
     # --- Extract and print ---
-    fextract = :($fnum = $(defid_fextract(ctx, nbits, dbits)))
+    fextract = :($fnum = $(defid_fextract(state, nbits, dbits)))
     fcast = dI == dT ? fnum : :($fnum % $dI)
     fvalue = if iszero(min) && !isnothing(option)
         :($fcast - $(one(dI)))
@@ -1975,7 +1983,7 @@ function defid_digits!(exprs::IdExprs,
     if isnothing(option)
         push!(exprs.print, fextract)
     else
-        push!(ctx[:oprint_detect], fextract, :($option = !iszero($fnum)))
+        push!(nctx[:oprint_detect], fextract, :($option = !iszero($fnum)))
     end
     directvar || push!(exprs.print, :($fieldvar = $fvalue))
     # Build extract for property access
@@ -1985,14 +1993,8 @@ function defid_digits!(exprs::IdExprs,
     else
         fvalue
     end
-    seg_extract = if isnothing(option)
-        ExprVarLine[fextract, propvalue]
-    else
-        ExprVarLine[fextract, :(if !iszero($fnum); $propvalue end)]
-    end
     # Build impart for constructor encoding
     argvar = gensym("arg_digit")
-    seg_impart = Any[]
     directval = cardbits(max - min + 1 + !isnothing(option)) ==
                 cardbits(max) && (min > 0 || isnothing(option))
     # Compute encode_expr: maps fnum → parsevar with appropriate offset
@@ -2014,7 +2016,13 @@ function defid_digits!(exprs::IdExprs,
         string("Value ", $argvar, " is above maximum ", $max)))))
     push!(body, :($fnum = $argvar % $dI))
     directvar || push!(body, encode_expr)
-    push!(body, defid_orshift(ctx, dT, parsevar, nbits))
+    push!(body, defid_orshift(state, dT, parsevar, nbits))
+    seg_extract = if isnothing(option)
+        ExprVarLine[fextract, propvalue]
+    else
+        ExprVarLine[fextract, :(if !iszero($fnum); $propvalue end)]
+    end
+    seg_impart = Any[]
     if isnothing(option)
         append!(seg_impart, body)
         seg_argtype = :Integer
@@ -2031,7 +2039,7 @@ function defid_digits!(exprs::IdExprs,
 end
 
 function defid_charseq!(exprs::IdExprs,
-                        ctx::Base.ImmutableDict{Symbol, Any},
+                        state::DefIdState, nctx::NodeCtx,
                         args::Vector{Any},
                         kind::Symbol)
     length(args) == 1 || throw(ArgumentError("Expected exactly one positional argument for $kind"))
@@ -2047,10 +2055,10 @@ function defid_charseq!(exprs::IdExprs,
     else
         throw(ArgumentError("Expected integer or range for $kind, got $arg"))
     end
-    function charseq_ranges(ctx, kind)
-        upper = get(ctx, :upper, false)::Bool
-        lower = get(ctx, :lower, false)::Bool
-        casefold = get(ctx, :casefold, false)::Bool
+    function charseq_ranges(nctx, kind)
+        upper = get(nctx, :upper, false)::Bool
+        lower = get(nctx, :lower, false)::Bool
+        casefold = get(nctx, :casefold, false)::Bool
         upper && lower && throw(ArgumentError("Cannot specify both upper=true and lower=true for $kind"))
         AZ = UInt8('A'):UInt8('Z')
         az = UInt8('a'):UInt8('z')
@@ -2060,9 +2068,9 @@ function defid_charseq!(exprs::IdExprs,
         print_ranges = kind === :letters ? letters : (d09, letters...)
         (; print_ranges, casefold)
     end
-    cfg = charseq_ranges(ctx, kind)
+    cfg = charseq_ranges(nctx, kind)
     variable = minlen != maxlen
-    option = get(ctx, :optional, nothing)
+    option = get(nctx, :optional, nothing)
     nvals = sum(length, cfg.print_ranges)
     bpc = cardbits(nvals)
     # When oneindexed, indices start at 1 so zero packed value means absent
@@ -2084,21 +2092,21 @@ function defid_charseq!(exprs::IdExprs,
     lenbits = if variable; cardbits(lenrange) else 0 end
     presbits = if !isnothing(option) && !variable && !oneindexed; 1 else 0 end
     totalbits = charbits + lenbits + presbits
-    fieldvar = get(ctx, :fieldvar, gensym(string(kind)))
+    fieldvar = get(nctx, :fieldvar, gensym(string(kind)))
     charvar = Symbol("$(fieldvar)_chars")
     lenvar = Symbol("$(fieldvar)_len")
     cT = cardtype(charbits)
     lT = if variable; cardtype(lenbits) else Nothing end
     ranges = cfg.print_ranges
     cfold = cfg.casefold
-    nbits_pos = (ctx[:bits][] += totalbits)
-    scanlimit = defid_lengthbound(ctx, maxlen)
-    inc_print!(ctx, minlen, maxlen)
-    inc_parsed!(ctx, minlen, maxlen)
+    nbits_pos = (state.bits += totalbits)
+    scanlimit = defid_lengthbound(state, nctx, maxlen)
+    inc_print!(nctx, minlen, maxlen)
+    inc_parsed!(nctx, minlen, maxlen)
     # --- Parse ---
     push!(exprs.parse,
           :(($lenvar, $charvar) = parsechars($cT, idbytes, pos, $scanlimit, $ranges, $cfold, $oneindexed)))
-    errmsg = defid_errmsg(ctx, if variable
+    errmsg = defid_errmsg(state, if variable
         "Expected $minlen to $maxlen $kind characters"
     else
         "Expected $maxlen $kind characters"
@@ -2125,7 +2133,7 @@ function defid_charseq!(exprs::IdExprs,
         minlen
     end
     push!(exprs.parse,
-          defid_orshift(ctx, cT, charvar, nbits_pos - lenbits - presbits),
+          defid_orshift(state, cT, charvar, nbits_pos - lenbits - presbits),
           :(pos += $lenvar))
     if variable
         lenpack = if lenbase == 0
@@ -2134,19 +2142,19 @@ function defid_charseq!(exprs::IdExprs,
             :($lenoffset = ($lenvar - $lenbase) % $lT)
         end
         push!(exprs.parse, lenpack,
-              defid_orshift(ctx, lT, lenoffset, nbits_pos))
+              defid_orshift(state, lT, lenoffset, nbits_pos))
     elseif presbits > 0
         push!(exprs.parse,
-              defid_orshift(ctx, Bool, option, nbits_pos))
+              defid_orshift(state, Bool, option, nbits_pos))
     end
     # --- Print / extract ---
-    fextract_chars = :($charvar = $(defid_fextract(ctx, nbits_pos - lenbits - presbits, charbits)))
+    fextract_chars = :($charvar = $(defid_fextract(state, nbits_pos - lenbits - presbits, charbits)))
     extracts = ExprVarLine[fextract_chars]
     if variable
         fextract_len = if lenbase == 0
-            :($lenvar = $(defid_fextract(ctx, nbits_pos, lenbits)))
+            :($lenvar = $(defid_fextract(state, nbits_pos, lenbits)))
         else
-            :($lenvar = $(defid_fextract(ctx, nbits_pos, lenbits)) + $lenbase)
+            :($lenvar = $(defid_fextract(state, nbits_pos, lenbits)) + $lenbase)
         end
         push!(extracts, fextract_len)
     end
@@ -2165,23 +2173,16 @@ function defid_charseq!(exprs::IdExprs,
     elseif oneindexed
         :(!iszero($charvar))
     else
-        :(!iszero($(defid_fextract(ctx, nbits_pos, presbits))))
+        :(!iszero($(defid_fextract(state, nbits_pos, presbits))))
     end
     if !isnothing(option)
-        push!(ctx[:oprint_detect], extracts..., :($option = $present))
+        push!(nctx[:oprint_detect], extracts..., :($option = $present))
     else
         append!(exprs.print, extracts)
     end
     push!(exprs.print, printex)
-    # Build extract for property access
-    seg_extract = if isnothing(option)
-        ExprVarLine[extracts..., tostringex]
-    else
-        ExprVarLine[extracts..., :(if $present; $tostringex end)]
-    end
     # Build impart for constructor encoding
     argvar = gensym("arg_charseq")
-    seg_impart = Any[]
     encode_chars = quote
         ($lenvar, $charvar) = parsechars($cT, String($argvar), $maxlen, $ranges, $cfold, $oneindexed)
         $lenvar == ncodeunits(String($argvar)) || throw(ArgumentError(
@@ -2197,7 +2198,7 @@ function defid_charseq!(exprs::IdExprs,
               :($lenvar != $maxlen && throw(ArgumentError(
                   string("String \"", $argvar, "\" must be exactly ", $maxlen, " characters"))))
           end)
-        $(defid_orshift(ctx, cT, charvar, nbits_pos - lenbits - presbits))
+        $(defid_orshift(state, cT, charvar, nbits_pos - lenbits - presbits))
         $(if variable
               lenpack_expr = if lenbase == 0
                   :($lenoffset = $lenvar % $lT)
@@ -2206,15 +2207,22 @@ function defid_charseq!(exprs::IdExprs,
               end
               quote
                   $lenpack_expr
-                  $(defid_orshift(ctx, lT, lenoffset, nbits_pos))
+                  $(defid_orshift(state, lT, lenoffset, nbits_pos))
               end
           elseif presbits > 0
-              defid_orshift(ctx, Bool, true, nbits_pos)
+              defid_orshift(state, Bool, true, nbits_pos)
           else
               nothing
           end)
     end
     charseq_body = clean_quote_args(encode_chars)
+    # Build extract for property access
+    seg_extract = if isnothing(option)
+        ExprVarLine[extracts..., tostringex]
+    else
+        ExprVarLine[extracts..., :(if $present; $tostringex end)]
+    end
+    seg_impart = Any[]
     if isnothing(option)
         append!(seg_impart, charseq_body)
         seg_argtype = :AbstractString
@@ -2232,14 +2240,18 @@ function defid_charseq!(exprs::IdExprs,
     nothing
 end
 
-function defid_orshift(ctx::Base.ImmutableDict{Symbol, Any}, type::Type, value::Union{Symbol, Expr}, shift::Int)
+# -----------------------------------------------------------
+# Bit packing and sentinel resolution
+# -----------------------------------------------------------
+
+function defid_orshift(state::DefIdState, type::Type, value::Union{Symbol, Expr}, shift::Int)
     valcast = Expr(:call, :__cast_to_id, type, value)
-    :(parsed = Core.Intrinsics.or_int(parsed, Core.Intrinsics.shl_int($valcast, (8 * sizeof($(esc(ctx[:name]))) - $shift))))
+    :(parsed = Core.Intrinsics.or_int(parsed, Core.Intrinsics.shl_int($valcast, (8 * sizeof($(esc(state.name))) - $shift))))
 end
 
-function defid_fextract(ctx::Base.ImmutableDict{Symbol, Any}, position::Int, width::Int)
+function defid_fextract(state::DefIdState, position::Int, width::Int)
     fT = cardtype(width)
-    fval = :(Core.Intrinsics.lshr_int(id, 8 * sizeof($(esc(ctx[:name]))) - $position))
+    fval = :(Core.Intrinsics.lshr_int(id, 8 * sizeof($(esc(state.name))) - $position))
     ival = Expr(:call, :__cast_from_id, fT, fval)
     if width == sizeof(fT) * 8
         ival
@@ -2249,60 +2261,44 @@ function defid_fextract(ctx::Base.ImmutableDict{Symbol, Any}, position::Int, wid
     end
 end
 
-"""
-    defid_lengthcheck(ctx, n_expr, [n_min, n_max])
-
-Emit a `__length_check(branch_id, emission_max, n_min, n_max, n_expr)` sentinel resolved by
-`resolve_length_checks!` once the branch's final parse byte minimum is known.
-"""
-function defid_lengthcheck(ctx::Base.ImmutableDict{Symbol, Any}, n_expr, n_min::Int=n_expr, n_max::Int=n_min)
-    b = ctx[:current_branch]
+"""Emit a `__length_check` sentinel resolved by `resolve_length_checks!`."""
+function defid_lengthcheck(state::DefIdState, nctx::NodeCtx, n_expr, n_min::Int=n_expr, n_max::Int=n_min)
+    b = nctx[:current_branch]
     Expr(:call, :__length_check, b.id, b.parsed_max, n_min, n_max, n_expr)
 end
 
 """Emit a `__static_length_check` sentinel resolving to `true`/`false` (never runtime)."""
-defid_static_lengthcheck(ctx::Base.ImmutableDict{Symbol, Any}, n::Int) =
-    let b = ctx[:current_branch]; Expr(:call, :__static_length_check, b.id, b.parsed_max, n) end
+defid_static_lengthcheck(state::DefIdState, nctx::NodeCtx, n::Int) =
+    let b = nctx[:current_branch]; Expr(:call, :__static_length_check, b.id, b.parsed_max, n) end
 
-"""
-    defid_lengthbound(ctx, n)
-
-Emit a `__length_bound(branch_id, emission_max, n)` sentinel that resolves to
-`n` when enough bytes are guaranteed, or `min(n, nbytes - pos + 1)` at runtime.
-"""
-function defid_lengthbound(ctx::Base.ImmutableDict{Symbol, Any}, n::Int)
-    b = ctx[:current_branch]
+"""Emit a `__length_bound` sentinel, resolving to `n` or `min(n, nbytes-pos+1)` at runtime."""
+function defid_lengthbound(state::DefIdState, nctx::NodeCtx, n::Int)
+    b = nctx[:current_branch]
     Expr(:call, :__length_bound, b.id, b.parsed_max, n)
 end
 
 """
     resolve_length_checks!(exprs, branches)
 
-Walk the AST and resolve length sentinels. Each sentinel captures `(branch_id,
-emission_max, ...)` at emit time. The fold formula is
-`branches[branch_id].parsed_min - emission_max >= threshold`: for root sentinels
-this is the global minimum guarantee; for optional-branch sentinels the
-`__branch_check(Bool, id)` guard ensures the branch minimum holds at runtime.
-Also resolves `__branch_check(Bool, id)` to `true` (when `local_min <= 0` or the
-parent's guarantee subsumes the child's needs) or `nbytes - pos + 1 >= local_min`,
-`__static_length_check` to `true`/`false` (dead branches folded by
-`fold_static_branches!` afterward), and `__length_bound` similarly.
+Walk the AST and resolve length sentinels to their static or runtime values.
+`__length_check` becomes `true` or `nbytes - pos + 1 >= n`;
+`__static_length_check` becomes a `Bool`; `__length_bound` becomes `n` or
+`min(n, nbytes - pos + 1)`; `__branch_check(Bool, id)` becomes `true` or a
+runtime guard. Static booleans left in `if`/`elseif` conditions are folded
+by the subsequent `fold_static_branches!` pass.
 """
 function resolve_length_checks!(exprlikes::Vector{<:ExprVarLine}, branches::Vector{ParseBranch})
-    elided = false
     splice_indices = Int[]
     for (idx, expr) in enumerate(exprlikes)
         expr isa Expr || continue
         if Meta.isexpr(expr, :call) && first(expr.args) === :__branch_check
             if expr.args[2] === Bool
-                val = resolve_branch_check(branches[expr.args[3]])
-                elided |= val isa Bool
-                exprlikes[idx] = val
+                exprlikes[idx] = resolve_branch_check(branches[expr.args[3]])
             end
             # Root branch check (args[2] is Int): leave for defid_parsebytes
             continue
         end
-        result, elided = resolve_length_check_expr!(expr, branches, elided)
+        result = resolve_length_check_expr!(expr, branches)
         if result === :remove
             push!(splice_indices, idx)
         elseif !isnothing(result)
@@ -2310,7 +2306,7 @@ function resolve_length_checks!(exprlikes::Vector{<:ExprVarLine}, branches::Vect
         end
     end
     deleteat!(exprlikes, splice_indices)
-    exprlikes, elided
+    exprlikes
 end
 
 # Resolve __length_check to true or a runtime `nbytes - pos + 1 >= n` expression.
@@ -2323,58 +2319,13 @@ function resolve_length_check_value(expr::Expr, branches::Vector{ParseBranch})
     branches[branch_id].parsed_min - emission_max >= n_max ? true : :(nbytes - pos + 1 >= $n_expr)
 end
 
-# Walk and resolve. Returns (replacement, elided) where replacement is
-# :remove, a value to splice in (Expr or literal), or nothing (modified in-place).
-function resolve_length_check_expr!(expr::Expr, branches::Vector{ParseBranch}, elided::Bool)
-    # if/elseif with __length_check or !__length_check condition — special
-    # handling to fold away the entire branch when statically known
-    if expr.head in (:if, :elseif)
-        cond = expr.args[1]
-        check, negated = if Meta.isexpr(cond, :call) && first(cond.args) === :__length_check
-            (cond, false)
-        elseif Meta.isexpr(cond, :call, 2) && cond.args[1] === :! &&
-               Meta.isexpr(cond.args[2], :call) && first(cond.args[2].args) === :__length_check
-            (cond.args[2], true)
-        else
-            (nothing, false)
-        end
-        if !isnothing(check)
-            val = resolve_length_check_value(check, branches)
-            if val isa Bool
-                # Statically known — keep the taken branch, discard the other
-                elided = true
-                taken = xor(val, negated)
-                promoted = if taken
-                    expr.args[2]
-                elseif length(expr.args) >= 3
-                    elsebranch = expr.args[3]
-                    if elsebranch isa Expr && elsebranch.head === :elseif
-                        elsebranch.head = :if
-                    end
-                    elsebranch
-                else
-                    nothing
-                end
-                isnothing(promoted) && return :remove, elided
-                # Recurse into the promoted branch to resolve any nested sentinels
-                if promoted isa Expr
-                    result, elided = resolve_length_check_expr!(promoted, branches, elided)
-                    !isnothing(result) && (promoted = result)
-                end
-                return promoted, elided
-            end
-            # Runtime — replace sentinel with actual comparison;
-            # n_expr is the 6th element in __length_check(branch_id, emission_max, n_min, n_max, n_expr)
-            expr.args[1] = negated ? :(nbytes - pos + 1 < $(check.args[6])) : val
-        end
-    end
-    # Recurse into all children, resolving sentinels wherever they appear
+# Walk and resolve sentinels. Returns :remove or nothing (modified in-place).
+function resolve_length_check_expr!(expr::Expr, branches::Vector{ParseBranch})
     splice_indices = Int[]
     for (i, arg) in enumerate(expr.args)
         arg isa Expr || continue
         if Meta.isexpr(arg, :call) && first(arg.args) === :__length_check
             val = resolve_length_check_value(arg, branches)
-            elided |= val isa Bool
             if val isa Expr
                 arg.head, arg.args = val.head, val.args
             else
@@ -2383,7 +2334,6 @@ function resolve_length_check_expr!(expr::Expr, branches::Vector{ParseBranch}, e
         elseif Meta.isexpr(arg, :call) && first(arg.args) === :__length_bound
             branch_id, emission_max, n = arg.args[2:end]
             if branches[branch_id].parsed_min - emission_max >= n
-                elided = true
                 expr.args[i] = n
             else
                 replacement = :(min($n, nbytes - pos + 1))
@@ -2391,12 +2341,10 @@ function resolve_length_check_expr!(expr::Expr, branches::Vector{ParseBranch}, e
             end
         elseif Meta.isexpr(arg, :call) && first(arg.args) === :__static_length_check
             branch_id, emission_max, n = arg.args[2:end]
-            elided = true
             expr.args[i] = branches[branch_id].parsed_min - emission_max >= n
         elseif Meta.isexpr(arg, :call) && first(arg.args) === :__branch_check
             if arg.args[2] === Bool
                 val = resolve_branch_check(branches[arg.args[3]])
-                elided |= val isa Bool
                 if val isa Expr
                     arg.head, arg.args = val.head, val.args
                 else
@@ -2405,7 +2353,7 @@ function resolve_length_check_expr!(expr::Expr, branches::Vector{ParseBranch}, e
             end
             # Root branch check: leave for defid_parsebytes
         else
-            result, elided = resolve_length_check_expr!(arg, branches, elided)
+            result = resolve_length_check_expr!(arg, branches)
             if result === :remove
                 push!(splice_indices, i)
             elseif !isnothing(result)
@@ -2414,14 +2362,14 @@ function resolve_length_check_expr!(expr::Expr, branches::Vector{ParseBranch}, e
         end
     end
     deleteat!(expr.args, splice_indices)
-    nothing, elided
+    nothing
 end
 
 """
     fold_static_branches!(exprlikes)
 
-Resolve `if true`/`if false` statically: splice the taken branch, discard the dead one.
-Handles `if`/`elseif`/`else` chains. Recurses until fixpoint.
+Resolve `if true`/`if false` and `if !true`/`if !false` statically: splice the taken
+branch, discard the dead one. Handles `if`/`elseif`/`else` chains. Recurses until fixpoint.
 """
 function fold_static_branches!(items::Vector{<:ExprVarLine})
     while _fold_static_vec!(items) end
@@ -2434,6 +2382,13 @@ function _fold_static_vec!(items::AbstractVector)
     for (i, item) in enumerate(items)
         item isa Expr || continue
         if item.head in (:if, :elseif) && item.args[1] isa Bool
+            push!(splices, (i, _take_branch(item)))
+            changed = true
+        elseif item.head in (:if, :elseif) &&
+               Meta.isexpr(item.args[1], :call, 2) &&
+               item.args[1].args[1] === :! && item.args[1].args[2] isa Bool
+            # Resolve negated boolean: !true → false, !false → true
+            item.args[1] = !item.args[1].args[2]
             push!(splices, (i, _take_branch(item)))
             changed = true
         else
@@ -2482,22 +2437,24 @@ function implement_casting!(expr::Expr, name::Symbol, finalsize::Int)
     expr
 end
 
-function implement_casting!(ctx::Base.ImmutableDict{Symbol, Any}, exprlikes::Vector{<:ExprVarLine})
-    finalsize = cld(ctx[:bits][], 8)
-    name = ctx[:name]
+function implement_casting!(state::DefIdState, exprlikes::Vector{<:ExprVarLine})
+    finalsize = cld(state.bits, 8)
     for expr in exprlikes
-        expr isa Expr && implement_casting!(expr, name, finalsize)
+        expr isa Expr && implement_casting!(expr, state.name, finalsize)
     end
     exprlikes
 end
 
-function defid_parsebytes(pexprs::Vector{ExprVarLine}, ctx::Base.ImmutableDict{Symbol, Any}, name::Symbol)
-    registry = ctx[:branches]
-    parsed_min = registry[1].parsed_min  # root branch's cumulative min
-    resolved, _ = resolve_length_checks!(implement_casting!(ctx, pexprs), registry)
+# -----------------------------------------------------------
+# Codegen assembly
+# -----------------------------------------------------------
+
+function defid_parsebytes(pexprs::Vector{ExprVarLine}, state::DefIdState, name::Symbol)
+    parsed_min = state.branches[1].parsed_min  # root branch's cumulative min
+    resolved = resolve_length_checks!(implement_casting!(state, pexprs), state.branches)
     fold_static_branches!(resolved)
     # Replace the root __branch_check sentinel with the upfront minimum-length check
-    errmsg = defid_errmsg(ctx, string("Expected at least ", parsed_min, " bytes"))
+    errmsg = defid_errmsg(state, string("Expected at least ", parsed_min, " bytes"))
     split_idx = findfirst(e -> Meta.isexpr(e, :call) && first(e.args) === :__branch_check &&
                                 e.args[2] == 1, resolved)
     if !isnothing(split_idx) && parsed_min > 0
@@ -2511,7 +2468,7 @@ function defid_parsebytes(pexprs::Vector{ExprVarLine}, ctx::Base.ImmutableDict{S
         !isnothing(split_idx) && deleteat!(resolved, split_idx)
     end
     :(Base.@assume_effects :foldable :nothrow function $(GlobalRef(@__MODULE__, :parsebytes))(::Type{$(esc(name))}, idbytes::AbstractVector{UInt8})
-          parsed = $(zero_parsed_expr(ctx, name))
+          parsed = $(zero_parsed_expr(state))
           pos = 1
           nbytes = length(idbytes)
           $(resolved...)
@@ -2519,8 +2476,8 @@ function defid_parsebytes(pexprs::Vector{ExprVarLine}, ctx::Base.ImmutableDict{S
       end)
 end
 
-function defid_parse(ctx::Base.ImmutableDict{Symbol, Any}, name::Symbol)
-    errmsgs = Tuple(ctx[:errconsts])
+function defid_parse(state::DefIdState, name::Symbol)
+    errmsgs = Tuple(state.errconsts)
     ename = esc(name)
     (:(function $(GlobalRef(Base, :parse))(::Type{$ename}, id::AbstractString)
            result, pos = parsebytes($ename, codeunits(id))
@@ -2674,8 +2631,8 @@ function strip_segsets!(expr::ExprVarLine)
     expr
 end
 
-function defid_shortcode(pexprs::Vector{ExprVarLine}, ctx::Base.ImmutableDict{Symbol, Any}, name::Symbol)
-    root = ctx[:current_branch]
+function defid_shortcode(pexprs::Vector{ExprVarLine}, state::DefIdState, name::Symbol)
+    root = state.branches[1]
     maxbytes = root.print_max
     minbytes = root.print_min
     fixedlen = minbytes == maxbytes
@@ -2713,7 +2670,7 @@ end
 
 function defid_properties(properties::Vector{Pair{Symbol, Union{Symbol, Vector{ExprVarLine}}}},
                           segs::Vector{IdValueSegment},
-                          ctx::Base.ImmutableDict{Symbol, Any}, name::Symbol)
+                          state::DefIdState, name::Symbol)
     isempty(properties) && return :()
     resolved = resolve_property_segments(properties, segs)
     fallback = :(throw(FieldError($(esc(name)), prop)))
@@ -2725,7 +2682,7 @@ function defid_properties(properties::Vector{Pair{Symbol, Union{Symbol, Vector{E
             copy(val)
         end
         qprop = QuoteNode(prop)
-        body = Expr(:block, implement_casting!(ctx, prop_exprs)...)
+        body = Expr(:block, implement_casting!(state, prop_exprs)...)
         Expr(ifelse(i == 1, :if, :elseif), :(prop === $qprop), body, rest)
     end
     :(function $(GlobalRef(Base, :getproperty))(id::$(esc(name)), prop::Symbol)
@@ -2777,7 +2734,7 @@ end
 
 function defid_constructor(segs::Vector{IdValueSegment},
                           properties::Vector{Pair{Symbol, Union{Symbol, Vector{ExprVarLine}}}},
-                          ctx::Base.ImmutableDict{Symbol, Any}, name::Symbol)
+                          state::DefIdState, name::Symbol)
     resolved = resolve_property_segments(properties, segs)
     isempty(resolved) && return :()
     # Build (argname, seg_index) pairs: single-node uses property name, multi-node
@@ -2800,7 +2757,7 @@ function defid_constructor(segs::Vector{IdValueSegment},
     argbindings = [:($(segs[si].argvar) = $aname) for (aname, si) in args]
     # Validate optional scope nesting — derive scope_parents from branch registry
     scope_parents = Dict{Symbol, Union{Nothing, Symbol}}()
-    for b in ctx[:branches]
+    for b in state.branches
         isnothing(b.scope) && continue
         scope_parents[b.scope] = isnothing(b.parent) ? nothing : b.parent.scope
     end
@@ -2820,12 +2777,12 @@ function defid_constructor(segs::Vector{IdValueSegment},
                     if !isnothing(pidxs)]
     # Build encode expressions from segment impart
     encode_exprs = reduce(vcat, (segs[si].impart for (_, si) in args); init=Any[])
-    finalsize = cld(ctx[:bits][], 8)
+    finalsize = cld(state.bits, 8)
     for expr in encode_exprs
         expr isa Expr && implement_casting!(expr, name, finalsize)
     end
     :(function $(esc(name))($(params...))
-          parsed = $(zero_parsed_expr(ctx, name))
+          parsed = $(zero_parsed_expr(state))
           $(argbindings...)
           $(scope_checks...)
           $(encode_exprs...)
@@ -2836,7 +2793,7 @@ end
 """Generate `Base.show(io::IO, id::T)` displaying constructor form, e.g. `T(42, :A)`."""
 function defid_show(segs::Vector{IdValueSegment},
                     properties::Vector{Pair{Symbol, Union{Symbol, Vector{ExprVarLine}}}},
-                    ctx::Base.ImmutableDict{Symbol, Any}, name::Symbol)
+                    state::DefIdState, name::Symbol)
     resolved = resolve_property_segments(properties, segs)
     isempty(resolved) && return :()
     # Build show body: each constructor arg separated by commas
@@ -2849,7 +2806,7 @@ function defid_show(segs::Vector{IdValueSegment},
             for (j, si) in enumerate(idxs)
                 j > 1 && push!(show_parts, :(print(io, ", ")))
                 extract_copy = map(copy, segs[si].extract)
-                implement_casting!(ctx, extract_copy)
+                implement_casting!(state, extract_copy)
                 push!(show_parts, Expr(:block, extract_copy[1:end-1]...,
                                        :(show(io, $(extract_copy[end])))))
             end
@@ -2870,28 +2827,27 @@ function defid_show(segs::Vector{IdValueSegment},
       end)
 end
 
-function defid_make(exprs::IdExprs, ctx::Base.ImmutableDict{Symbol, Any}, name::Symbol)
+function defid_make(exprs::IdExprs, state::DefIdState, name::Symbol)
     block = Expr(:toplevel)
-    numbits = 8 * cld(ctx[:bits][], 8)
-    prefix = get(ctx, :purlprefix, nothing)
-    implement_casting!(ctx, exprs.print)
+    numbits = 8 * cld(state.bits, 8)
+    implement_casting!(state, exprs.print)
     push!(block.args,
           :(Base.@__doc__(primitive type $(esc(name)) <: $AbstractIdentifier $numbits end)),
-          :($(GlobalRef(@__MODULE__, :nbits))(::Type{$(esc(name))}) = $(ctx[:bits][])),
-          defid_parsebytes(exprs.parse, ctx, name),
-          defid_parse(ctx, name)...,
-          defid_shortcode(exprs.print, ctx, name),
+          :($(GlobalRef(@__MODULE__, :nbits))(::Type{$(esc(name))}) = $(state.bits)),
+          defid_parsebytes(exprs.parse, state, name),
+          defid_parse(state, name)...,
+          defid_shortcode(exprs.print, state, name),
           :($(GlobalRef(Base, :propertynames))(::$(esc(name))) = $(Tuple(map(first, exprs.properties)))),
-          defid_properties(exprs.properties, exprs.segments, ctx, name),
+          defid_properties(exprs.properties, exprs.segments, state, name),
           defid_segments_type(exprs.segments, name),
           defid_segments_value(exprs.segments, exprs.print, name),
-          defid_constructor(exprs.segments, exprs.properties, ctx, name),
-          defid_show(exprs.segments, exprs.properties, ctx, name),
+          defid_constructor(exprs.segments, exprs.properties, state, name),
+          defid_show(exprs.segments, exprs.properties, state, name),
           :($(GlobalRef(Base, :isless))(a::$(esc(name)), b::$(esc(name))) =
                 Core.Intrinsics.ult_int(a, b)))
-    if !isnothing(prefix)
+    if !isnothing(state.purlprefix)
         push!(block.args,
-              :($(GlobalRef(@__MODULE__, :purlprefix))(::Type{$(esc(name))}) = $prefix))
+              :($(GlobalRef(@__MODULE__, :purlprefix))(::Type{$(esc(name))}) = $(state.purlprefix)))
     end
     push!(block.args, esc(name))
     block
