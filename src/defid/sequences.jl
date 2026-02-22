@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: MPL-2.0
 
 # Pattern handlers for value-carrying sequences: digits, character sequences
-# (letters, alphnum), and embedded identifier types. These emit parse/print
-# expressions, bit-packing, and constructor impart code.
+# (letters, alphnum, hex, charset), and embedded identifier types. These emit
+# parse/print expressions, bit-packing, and constructor impart code.
 
 ## Digits
 
@@ -24,18 +24,20 @@ function defid_digits!(exprs::IdExprs,
         max = (base^maxdigits) - 1
     end
     option = get(nctx, :optional, nothing)
-    range = max - min + 1 + !isnothing(option)
-    directval = cardbits(range) == cardbits(max) && (min > 0 || isnothing(option))
-    dbits = sizeof(typeof(range)) * 8 - leading_zeros(range)
-    dI = cardtype(8 * sizeof(typeof(max)) - leading_zeros(max))
+    claims = unclaimed_sentinel(nctx)
+    range = max - min + 1 + claims
+    directval = cardbits(range) == cardbits(max + 1) && (min > 0 || !claims)
+    dbits = cardbits(range)
+    dI = cardtype(cardbits(max + 1))
     dT = cardtype(dbits)
     fieldvar = get(nctx, :fieldvar, gensym("digits"))
     nbits = (state.bits += dbits)
+    claims && claim_sentinel!(nctx, nbits, dbits)
     fixedpad = ifelse(fixedwidth, maxdigits, 0)
     printmin = Base.max(ndigits(Base.max(min, 1); base), pad, fixedpad)
     printmax = Base.max(ndigits(max; base), pad, fixedpad)
     # gen_digit_parse reads parsed_min for SWAR safety, so call before updating
-    dspec = (; base, mindigits, maxdigits, min, max, pad, dI, dT)
+    dspec = (; base, mindigits, maxdigits, min, max, pad, dI, dT, claims_sentinel=claims)
     parsed = gen_digit_parse(state, nctx, fieldvar, option, dspec)
     inc_print!(nctx, printmin, printmax)
     inc_parsed!(nctx, mindigits, maxdigits)
@@ -53,10 +55,10 @@ function defid_digits!(exprs::IdExprs,
     # Extract and print
     fextract = :($fnum = $(defid_emit_extract(state, nbits, dbits)))
     fcast = if dI == dT; fnum else :($fnum % $dI) end
-    fvalue = if iszero(min) && !isnothing(option)
+    fvalue = if iszero(min) && claims
         :($fcast - $(one(dI)))
-    elseif !directval && min - !isnothing(option) > 0
-        :(($fcast + $(dI(min - !isnothing(option)))) % $dI)
+    elseif !directval && min - claims > 0
+        :(($fcast + $(dI(min - claims))) % $dI)
     else
         fcast
     end
@@ -81,7 +83,7 @@ function defid_digits!(exprs::IdExprs,
                       elseif max < base^maxdigits - 1
                           ", at most $(string(max; base, pad))"
                       else "" end)
-    emit_print_detect!(exprs, nctx, option, ExprVarLine[fextract], :(!iszero($fnum)))
+    emit_print_detect!(exprs, nctx, option, ExprVarLine[fextract])
     directvar || push!(exprs.print, :($fieldvar = $fvalue))
     push!(exprs.print, printex)
     # Property extract value
@@ -93,14 +95,14 @@ function defid_digits!(exprs::IdExprs,
     end
     # Constructor impart
     argvar = gensym("arg_digit")
-    directval = cardbits(max - min + 1 + !isnothing(option)) ==
-                cardbits(max) && (min > 0 || isnothing(option))
-    offset = min - !isnothing(option)
+    directval = cardbits(max - min + 1 + claims) ==
+                cardbits(max + 1) && (min > 0 || !claims)
+    offset = min - claims
     encode_expr = if directval
         if dI != dT; :($parsevar = $fnum % $dT) else :($parsevar = $fnum) end
     elseif offset > 0
         :($parsevar = (($fnum - $(dT(offset))) % $dT))
-    elseif offset < 0  # optional with min==0: +1 to reserve zero for "absent"
+    elseif offset < 0  # sentinel claim with min==0: +1 to reserve zero for "absent"
         :($parsevar = ($fnum + $(one(dT))) % $dT)
     else
         if dI != dT; :($parsevar = $fnum % $dT) else :($parsevar = $fnum) end
@@ -117,7 +119,7 @@ function defid_digits!(exprs::IdExprs,
         nbits=dbits, kind=:digits, fieldvar, desc=seg_desc,
         argvar, base_argtype=:Integer, option,
         extract_setup=ExprVarLine[fextract], extract_value=propvalue,
-        present_check=:(!iszero($fnum)), impart_body=body)
+        present_check=true, impart_body=body)
 end
 
 function parse_digit_range(args, max, base)
@@ -136,15 +138,34 @@ function parse_digit_range(args, max, base)
     end
 end
 
-## Character sequences (letters, alphnum)
+## Character sequences (letters, alphnum, hex, charset)
 
-function defid_charseq!(exprs::IdExprs,
-                        state::DefIdState, nctx::NodeCtx,
-                        args::Vector{Any},
-                        kind::Symbol)
-    length(args) == 1 || throw(ArgumentError("Expected exactly one positional argument for $kind"))
-    arg = first(args)
-    minlen, maxlen = if arg isa Integer
+# Named charset canonical ranges.
+# letters/alphnum include both cases (case-preserving by default).
+# hex is single-case uppercase by default.
+const NAMED_CHARSETS = (
+    letters = (UInt8('A'):UInt8('Z'), UInt8('a'):UInt8('z')),
+    alphnum = (UInt8('0'):UInt8('9'), UInt8('A'):UInt8('Z'), UInt8('a'):UInt8('z')),
+    hex     = (UInt8('0'):UInt8('9'), UInt8('A'):UInt8('F')),
+)
+
+function defid_charseq!(exprs::IdExprs, state::DefIdState, nctx::NodeCtx,
+                        args::Vector{Any}, kind::Symbol)
+    named = haskey(NAMED_CHARSETS, kind)
+    minargs = named ? 1 : 2
+    length(args) >= minargs || throw(ArgumentError(
+        named ? "Expected exactly one positional argument for $kind" :
+                "charset requires a length and at least one character range"))
+    named && length(args) > 1 && throw(ArgumentError(
+        "Expected exactly one positional argument for $kind"))
+    minlen, maxlen = parse_charseq_length(first(args), kind)
+    base_ranges = named ? NAMED_CHARSETS[kind] : parse_charset_ranges(args)
+    ranges, cfold = resolve_charseq_flags(state, nctx, kind, base_ranges)
+    defid_charseq_impl!(exprs, state, nctx, minlen, maxlen, ranges, cfold, kind)
+end
+
+function parse_charseq_length(arg, kind::Symbol)
+    if arg isa Integer
         (arg, arg)
     elseif Meta.isexpr(arg, :call, 3) && first(arg.args) == :(:)
         lo, hi = arg.args[2], arg.args[3]
@@ -155,19 +176,94 @@ function defid_charseq!(exprs::IdExprs,
     else
         throw(ArgumentError("Expected integer or range for $kind, got $arg"))
     end
-    ranges, cfold = charseq_config(nctx, kind)
+end
+
+function parse_charset_ranges(args)
+    ranges = UnitRange{UInt8}[]
+    for arg in @view args[2:end]
+        if arg isa Char
+            b = UInt8(arg)
+            push!(ranges, b:b)
+        elseif Meta.isexpr(arg, :call, 3) && first(arg.args) == :(:)
+            lo, hi = arg.args[2], arg.args[3]
+            (lo isa Char && hi isa Char) ||
+                throw(ArgumentError("charset range bounds must be character literals, got $lo:$hi"))
+            lo <= hi || throw(ArgumentError("charset range '$lo':'$hi' is empty"))
+            push!(ranges, UInt8(lo):UInt8(hi))
+        else
+            throw(ArgumentError("charset arguments must be character ranges ('a':'z') or single characters ('x'), got $arg"))
+        end
+    end
+    ranges
+end
+
+"""
+    resolve_charseq_flags(state, nctx, kind, ranges) -> (Vector{UnitRange{UInt8}}, cfold::Bool)
+
+Resolve `upper`/`lower`/`casefold` flags and transform character ranges.
+
+- `casefold=true`: collapse letter ranges to uppercase, `cfold=true`
+- `upper=true`: collapse letter ranges to uppercase, `cfold` from casefold flag
+- `lower=true`: collapse letter ranges to lowercase, `cfold` from casefold flag
+- No flags, `casefold=false`: ranges unchanged, `cfold=false`
+
+Letter ranges (subsets of A-Z or a-z) are shifted to the target case and deduplicated.
+Non-letter ranges pass through unchanged.
+"""
+function resolve_charseq_flags(state::DefIdState, nctx, kind::Symbol, ranges)
+    upper = get(nctx, :upper, false)::Bool
+    lower = get(nctx, :lower, false)::Bool
+    casefold = get(nctx, :casefold, state.casefold)::Bool
+    upper && lower && throw(ArgumentError("Cannot specify both upper=true and lower=true for $kind"))
+    if lower
+        collapse_letter_ranges(ranges, :lower), casefold
+    elseif upper || casefold
+        collapse_letter_ranges(ranges, :upper), casefold
+    else
+        collect(UnitRange{UInt8}, ranges), false
+    end
+end
+
+is_letter(r::UnitRange{UInt8}) =
+    (first(r) in UInt8('A'):UInt8('Z') && last(r) in UInt8('A'):UInt8('Z')) ||
+    (first(r) in UInt8('a'):UInt8('z') && last(r) in UInt8('a'):UInt8('z'))
+
+function collapse_letter_ranges(ranges, target::Symbol)
+    function shift_case(r::UnitRange{UInt8}, direction::Symbol)
+        if direction === :upper
+            (first(r) & 0xdf):(last(r) & 0xdf)
+        else
+            (first(r) | 0x20):(last(r) | 0x20)
+        end
+    end
+    seen = Set{UnitRange{UInt8}}()
+    out = UnitRange{UInt8}[]
+    for r in ranges
+        mapped = if is_letter(r); shift_case(r, target) else r end
+        if mapped ∉ seen
+            push!(seen, mapped)
+            push!(out, mapped)
+        end
+    end
+    sort!(out; by=first)
+end
+
+function defid_charseq_impl!(exprs::IdExprs,
+                             state::DefIdState, nctx::NodeCtx,
+                             minlen::Int, maxlen::Int,
+                             ranges::Vector{UnitRange{UInt8}},
+                             cfold::Bool, kind::Symbol)
+    ranges = Tuple(ranges)  # runtime functions dispatch on NTuple
     variable = minlen != maxlen
     option = get(nctx, :optional, nothing)
     nvals = sum(length, ranges)
     bpc = cardbits(nvals)
-    # When oneindexed, indices start at 1 so zero packed value means absent
-    oneindexed = !isnothing(option) && !variable && cardbits(nvals + 1) == bpc
-    if oneindexed
-        bpc = cardbits(nvals + 1)
-    end
+    claims = unclaimed_sentinel(nctx)
+    oneindexed = claims && !variable
+    if oneindexed; bpc = cardbits(nvals + 1) end
     charbits = maxlen * bpc
-    # Store length directly when it fits in the same bits as the range offset
-    optoffset = !isnothing(option) && variable && minlen > 0
+    claim_via_length = claims && !oneindexed && variable
+    optoffset = claim_via_length && minlen > 0
     directlen = variable && cardbits(maxlen + 1) == cardbits(maxlen - minlen + 1 + optoffset)
     lenrange = if !variable
         0
@@ -177,14 +273,16 @@ function defid_charseq!(exprs::IdExprs,
         maxlen - minlen + 1 + optoffset
     end
     lenbits = if variable; cardbits(lenrange) else 0 end
-    presbits = if !isnothing(option) && !variable && !oneindexed; 1 else 0 end
-    totalbits = charbits + lenbits + presbits
+    totalbits = charbits + lenbits
     fieldvar = get(nctx, :fieldvar, gensym(string(kind)))
     charvar = Symbol("$(fieldvar)_chars")
     lenvar = Symbol("$(fieldvar)_len")
     cT = cardtype(charbits)
     lT = if variable; cardtype(lenbits) else Nothing end
     nbits_pos = (state.bits += totalbits)
+    if oneindexed; claim_sentinel!(nctx, nbits_pos - lenbits, charbits)
+    elseif claim_via_length; claim_sentinel!(nctx, nbits_pos, lenbits)
+    end
     scanlimit = defid_lengthbound(state, nctx, maxlen)
     inc_print!(nctx, minlen, maxlen)
     inc_parsed!(nctx, minlen, maxlen)
@@ -218,7 +316,7 @@ function defid_charseq!(exprs::IdExprs,
         minlen
     end
     push!(exprs.parse,
-          defid_emit_pack(state, cT, charvar, nbits_pos - lenbits - presbits),
+          defid_emit_pack(state, cT, charvar, nbits_pos - lenbits),
           :(pos += $lenvar))
     if variable
         lenpack = if lenbase == 0
@@ -228,12 +326,9 @@ function defid_charseq!(exprs::IdExprs,
         end
         push!(exprs.parse, lenpack,
               defid_emit_pack(state, lT, lenoffset, nbits_pos))
-    elseif presbits > 0
-        push!(exprs.parse,
-              defid_emit_pack(state, Bool, option, nbits_pos))
     end
     # Print / extract
-    fextract_chars = :($charvar = $(defid_emit_extract(state, nbits_pos - lenbits - presbits, charbits)))
+    fextract_chars = :($charvar = $(defid_emit_extract(state, nbits_pos - lenbits, charbits)))
     extracts = ExprVarLine[fextract_chars]
     if variable
         fextract_len = if lenbase == 0
@@ -253,14 +348,7 @@ function defid_charseq!(exprs::IdExprs,
     else
         :(chars2string($charvar, $maxlen, $ranges, $oneindexed))
     end
-    present = if variable
-        if minlen == 0; :($lenvar > 0) else :(!iszero($lenvar)) end
-    elseif oneindexed
-        :(!iszero($charvar))
-    else
-        :(!iszero($(defid_emit_extract(state, nbits_pos, presbits))))
-    end
-    emit_print_detect!(exprs, nctx, option, extracts, present)
+    emit_print_detect!(exprs, nctx, option, extracts)
     push!(exprs.print, printex)
     # Constructor impart
     argvar = gensym("arg_charseq")
@@ -279,7 +367,7 @@ function defid_charseq!(exprs::IdExprs,
               :($lenvar != $maxlen && throw(ArgumentError(
                   string("String \"", $argvar, "\" must be exactly ", $maxlen, " characters"))))
           end)
-        $(defid_emit_pack(state, cT, charvar, nbits_pos - lenbits - presbits))
+        $(defid_emit_pack(state, cT, charvar, nbits_pos - lenbits))
         $(if variable
               lenpack_expr = if lenbase == 0
                   :($lenoffset = $lenvar % $lT)
@@ -290,8 +378,6 @@ function defid_charseq!(exprs::IdExprs,
                   $lenpack_expr
                   $(defid_emit_pack(state, lT, lenoffset, nbits_pos))
               end
-          elseif presbits > 0
-              defid_emit_pack(state, Bool, true, nbits_pos)
           else
               nothing
           end)
@@ -303,22 +389,9 @@ function defid_charseq!(exprs::IdExprs,
                     " ", kind, if maxlen > 1; " characters" else " character" end),
         argvar, base_argtype=:AbstractString, option,
         extract_setup=extracts, extract_value=tostringex,
-        present_check=present, impart_body=charseq_body)
+        present_check=true, impart_body=charseq_body)
 end
 
-function charseq_config(nctx, kind)
-    upper = get(nctx, :upper, false)::Bool
-    lower = get(nctx, :lower, false)::Bool
-    casefold = get(nctx, :casefold, false)::Bool
-    upper && lower && throw(ArgumentError("Cannot specify both upper=true and lower=true for $kind"))
-    AZ = UInt8('A'):UInt8('Z')
-    az = UInt8('a'):UInt8('z')
-    d09 = UInt8('0'):UInt8('9')
-    singlecase = upper || lower || casefold
-    letters = if lower && !upper; (az,) elseif singlecase; (AZ,) else (AZ, az) end
-    ranges = if kind === :letters; letters else (d09, letters...) end
-    (ranges, casefold)
-end
 
 ## Embedded identifier types
 
@@ -332,9 +405,11 @@ function defid_embed!(exprs::IdExprs,
     ebits = nbits(T)
     epad = 8 * sizeof(T) - ebits  # MSB padding bits in the embedded type
     option = get(nctx, :optional, nothing)
-    presbits = isnothing(option) ? 0 : 1
+    claims = unclaimed_sentinel(nctx)
+    presbits = claims ? 1 : 0
     fieldvar = get(nctx, :fieldvar, gensym("embed"))
     nbits_pos = (state.bits += ebits + presbits)
+    claims && claim_sentinel!(nctx, nbits_pos, presbits)
     inc_parsed!(nctx, parsebounds(T)...)
     inc_print!(nctx, printbounds(T)...)
     # @defid types pack from the MSB, so embedded values must be shifted
@@ -358,18 +433,16 @@ function defid_embed!(exprs::IdExprs,
           :($eshifted = $(to_lsb(eresult))))
     if isnothing(option)
         push!(exprs.parse, pack, :(pos += $epos - 1))
-    else
+    elseif claims
         push!(exprs.parse,
               :(if $option; $pack; $(defid_emit_pack(state, Bool, option, nbits_pos)); pos += $epos - 1 end))
+    else
+        push!(exprs.parse,
+              :(if $option; $pack; pos += $epos - 1 end))
     end
     # Extract + print
     fextract = :($fieldvar = $(to_msb(defid_emit_extract(state, nbits_pos - presbits, ebits, T))))
-    present = if presbits > 0
-        :(!iszero($(defid_emit_extract(state, nbits_pos, presbits))))
-    else
-        true
-    end
-    emit_print_detect!(exprs, nctx, option, ExprVarLine[fextract], present)
+    emit_print_detect!(exprs, nctx, option, ExprVarLine[fextract])
     push!(exprs.print, :(shortcode(io, $fieldvar)))
     # Constructor impart
     argvar = gensym("arg_embed")
@@ -384,5 +457,5 @@ function defid_embed!(exprs::IdExprs,
         desc="embedded $(T)",
         argvar, base_argtype=T, option,
         extract_setup=ExprVarLine[fextract], extract_value=fieldvar,
-        present_check=present, impart_body=body)
+        present_check=true, impart_body=body)
 end

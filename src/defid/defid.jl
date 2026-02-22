@@ -4,8 +4,8 @@
 module DefId
 
 using FastIdentifiers: FastIdentifiers, AbstractIdentifier, MalformedIdentifier,
-    shortcode, purlprefix, segments, nbits, parsebytes, tobytes,
-    parsebounds, printbounds
+    ChecksumViolation, shortcode, purlprefix, segments, nbits, parsebytes, tobytes,
+    parsebounds, printbounds, idchecksum, idcode
 
 include("utils.jl")
 include("core.jl")
@@ -16,6 +16,7 @@ include("choices.jl")
 include("placeholders.jl")
 include("methods.jl")
 include("sequences.jl")
+include("checkdigits.jl")
 include("dispatch.jl")
 
 """
@@ -32,8 +33,10 @@ Available constructs:
 - `choice([is=opt0], opt1, opt2, ...)`: choose between literal strings
 - `literal(str)`: required literal string
 - `digits([n | min:max], [base=10, min=0, max=base^digits-1, pad=0])`: digit field
-- `letters([n | min:max])`, `alphnum([n | min:max])`: character sequences
+- `letters([n | min:max])`, `alphnum([n | min:max])`, `hex([n | min:max])`: character sequences
+- `charset([n | min:max], range1, range2, ...)`: custom character set (ranges are `'a':'z'` or single `'x'`)
 - `embed(Type)`: embed another `@defid` primitive type
+- `checkdigit(:field, fn)`: check digit validated against `fn(field_value)`
 
 Use `:field(pattern)` to capture a sub-pattern as a named property.
 
@@ -68,7 +71,7 @@ macro defid(name, pattern, args...)
         kwname === :purlprefix && (prefix_val = kwval)
     end
     root = ParseBranch(1, nothing, nothing, 0, 0, 0, 0, 0)
-    state = DefIdState(name, __module__, 0, casefold_val, prefix_val, ParseBranch[root], String[])
+    state = DefIdState(name, __module__, 0, casefold_val, prefix_val, ParseBranch[root], String[], nothing)
     nctx = NodeCtx(:current_branch, root)
     exprs = IdExprs(([], [], [], []))
     if !isnothing(prefix_val)

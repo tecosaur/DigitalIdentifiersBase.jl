@@ -35,7 +35,8 @@ function choice_setup(state::DefIdState, nctx::NodeCtx, options::Vector{Any})
     target = get(nctx, :is, nothing)::Union{Nothing, String}
     fieldvar = get(nctx, :fieldvar, gensym("prefix"))
     option = get(nctx, :optional, nothing)
-    choicebits = cardbits(length(soptions) + !isnothing(option))
+    claims = unclaimed_sentinel(nctx)
+    choicebits = cardbits(length(soptions) + 1)
     choiceint = if isnothing(target)
         cardtype(choicebits)
     else
@@ -78,12 +79,13 @@ function choice_setup(state::DefIdState, nctx::NodeCtx, options::Vector{Any})
           end)
     end
     (; soptions, fieldvar, option, allowempty, choicebits, choiceint,
-       checkedmatch, matcher, target)
+       checkedmatch, matcher, target, claims)
 end
 
 function choice_value!(exprs::IdExprs, state::DefIdState, nctx::NodeCtx, ctx)
-    (; soptions, fieldvar, option, allowempty, choicebits, choiceint, checkedmatch) = ctx
+    (; soptions, fieldvar, option, allowempty, choicebits, choiceint, checkedmatch, claims) = ctx
     nbits = (state.bits += choicebits)
+    claims && claim_sentinel!(nctx, nbits, choicebits)
     pmin = if allowempty; 0 else minimum(ncodeunits, soptions) end
     inc_print!(nctx, pmin, maximum(ncodeunits, soptions))
     inc_parsed!(nctx, pmin, maximum(ncodeunits, soptions))
@@ -94,7 +96,7 @@ function choice_value!(exprs::IdExprs, state::DefIdState, nctx::NodeCtx, ctx)
     fextract = :($fieldvar = $(defid_emit_extract(state, nbits, choicebits)))
     symoptions = Tuple(Symbol.(soptions))
     present = :(!iszero($fieldvar))
-    emit_print_detect!(exprs, nctx, option, ExprVarLine[fextract], present)
+    emit_print_detect!(exprs, nctx, option, ExprVarLine[fextract])
     printexpr = :(print(io, @inbounds $(Tuple(soptions))[$fieldvar]))
     # When allowempty without an enclosing optional, guard print on presence
     push!(exprs.print, if allowempty && isnothing(option)
@@ -122,8 +124,7 @@ function choice_value!(exprs::IdExprs, state::DefIdState, nctx::NodeCtx, ctx)
         nbits=choicebits, kind=:choice, fieldvar, desc=join(soptions, " | "),
         argvar, base_argtype=:Symbol, option=eopt,
         extract_setup=ExprVarLine[fextract],
-        extract_value,
-        present_check=present,
+        extract_value, present_check=true,
         impart_body=impart_core)
 end
 

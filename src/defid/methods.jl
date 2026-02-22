@@ -46,6 +46,24 @@ function defid_make(exprs::IdExprs, state::DefIdState, name::Symbol)
         push!(block.args,
               :($(GlobalRef(FastIdentifiers, :purlprefix))(::Type{$(esc(name))}) = $(state.purlprefix)))
     end
+    if !isnothing(state.checksum)
+        (; fn, field_seg_idx) = state.checksum
+        seg = exprs.segments[field_seg_idx]
+        # idchecksum: extract the field value, apply the checksum function
+        cs_extract = map(copy, seg.extract)
+        implement_casting!(state, cs_extract)
+        cs_value = last(cs_extract)
+        push!(block.args,
+              :(function $(GlobalRef(FastIdentifiers, :idchecksum))(id::$(esc(name)))
+                    $(cs_extract[1:end-1]...)
+                    $fn($cs_value)
+                end),
+              # idcode: return the field value directly
+              :(function $(GlobalRef(FastIdentifiers, :idcode))(id::$(esc(name)))
+                    $(cs_extract[1:end-1]...)
+                    $cs_value
+                end))
+    end
     push!(block.args, esc(name))
     block
 end
@@ -56,6 +74,14 @@ function defid_parsebytes(pexprs::Vector{ExprVarLine}, state::DefIdState, name::
     parsed_min = state.branches[1].parsed_min
     resolved = resolve_length_checks!(implement_casting!(state, pexprs), state.branches)
     fold_static_branches!(resolved)
+    # Resolve __checksum_gate sentinel
+    gate_idx = findfirst(resolved) do e
+        Meta.isexpr(e, :call) && first(e.args) === :__checksum_gate
+    end
+    if !isnothing(gate_idx)
+        ok_sym, checkpos_sym = resolved[gate_idx].args[2:3]
+        resolved[gate_idx] = :($ok_sym || return (parsed, -$checkpos_sym))
+    end
     # Replace the root __branch_check sentinel with an upfront minimum-length check
     errmsg = defid_errmsg(state, string("Expected at least ", parsed_min, " bytes"))
     split_idx = findfirst(resolved) do e
@@ -82,18 +108,47 @@ end
 function defid_parse(state::DefIdState, name::Symbol)
     errmsgs = Tuple(state.errconsts)
     ename = esc(name)
+    has_checksum = !isnothing(state.checksum)
+    parse_body = if has_checksum
+        fn_ref = state.checksum.fn
+        byte_to_val = state.checksum.parse_expr
+        quote
+            result, pos = parsebytes($ename, codeunits(id))
+            if result isa $ename
+                if pos < 0
+                    # Checksum violation: re-read the check byte to report provided value
+                    checkbyte = @inbounds codeunits(id)[-pos]
+                    provided = $byte_to_val
+                    throw(ChecksumViolation{$ename}(id, idchecksum(result), provided))
+                end
+                pos > ncodeunits(id) || throw(MalformedIdentifier{$ename}(id, "Unparsed trailing content"))
+                result
+            else
+                throw(MalformedIdentifier{$ename}(id, @inbounds $errmsgs[result]))
+            end
+        end
+    else
+        quote
+            result, pos = parsebytes($ename, codeunits(id))
+            if result isa $ename
+                pos > ncodeunits(id) || throw(MalformedIdentifier{$ename}(id, "Unparsed trailing content"))
+                result
+            else
+                throw(MalformedIdentifier{$ename}(id, @inbounds $errmsgs[result]))
+            end
+        end
+    end
+    tryparse_cond = if has_checksum
+        :(result isa $ename && pos > 0 && pos > ncodeunits(id))
+    else
+        :(result isa $ename && pos > ncodeunits(id))
+    end
     (:(function $(GlobalRef(Base, :parse))(::Type{$ename}, id::AbstractString)
-           result, pos = parsebytes($ename, codeunits(id))
-           if result isa $ename
-               pos > ncodeunits(id) || throw(MalformedIdentifier{$ename}(id, "Unparsed trailing content"))
-               result
-           else
-               throw(MalformedIdentifier{$ename}(id, @inbounds $errmsgs[result]))
-           end
+           $(parse_body.args...)
        end),
      :(function $(GlobalRef(Base, :tryparse))(::Type{$ename}, id::AbstractString)
            result, pos = parsebytes($ename, codeunits(id))
-           if result isa $ename && pos > ncodeunits(id)
+           if $tryparse_cond
                result
            end
        end))
@@ -385,6 +440,8 @@ function rewrite_bufprint!(pexprs::Union{Vector{<:ExprVarLine}, Vector{Any}})
             fname, _, args... = expr.args
             replacement = if fname == :print
                 rewrite_print_call(args)
+            elseif fname == :write && length(args) == 1
+                Any[:(buf[pos += 1] = $(args[1]))]
             elseif fname == :printchars
                 Any[:(pos = bufprintchars(buf, pos, $(args...)))]
             elseif fname == :shortcode

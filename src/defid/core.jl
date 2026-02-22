@@ -12,11 +12,13 @@
 
 const ExprVarLine = Union{Expr, Symbol, LineNumberNode}
 const NodeCtx = Base.ImmutableDict{Symbol, Any}
+# Hoisted optional sentinel: bit coordinates where absent = all-zero.
+const OptSentinel = @NamedTuple{position::Int, nbits::Int}
 
 # Schema for a single value-carrying pattern node in the packed representation.
 const IdValueSegment = @NamedTuple{
     nbits::Int,                            # bits consumed in packed representation
-    kind::Symbol,                          # :digits, :choice, :letters, :alphnum, :literal, :skip
+    kind::Symbol,                          # :digits, :choice, :letters, :alphnum, :hex, :charset, :literal, :skip
     label::Symbol,                         # attr_fieldname (inside field) or gensym (anonymous)
     desc::String,                          # human-readable description
     argtype::Any,                          # :Integer, :Symbol, :AbstractString, or nothing (non-parameterisable)
@@ -58,6 +60,13 @@ mutable struct ParseBranch
     print_max::Int
 end
 
+# Resolved checkdigit metadata for downstream codegen.
+const ChecksumInfo = @NamedTuple{
+    fn::Union{GlobalRef, Expr},  # the checksum function reference for codegen
+    field_seg_idx::Int,          # index into exprs.segments of the referenced field
+    parse_expr::Expr,            # byte→value expression (uses :checkbyte as the byte var)
+}
+
 # Global mutable state for @defid macro expansion (bit width, branches, errors).
 mutable struct DefIdState
     const name::Symbol
@@ -67,6 +76,7 @@ mutable struct DefIdState
     const purlprefix::Union{Nothing, String}
     const branches::Vector{ParseBranch}
     const errconsts::Vector{String}
+    checksum::Union{Nothing, ChecksumInfo}
 end
 
 ## Constants
@@ -76,7 +86,10 @@ const KNOWN_KEYS = (
     digits = (:base, :min, :max, :pad),
     letters = (:upper, :lower, :casefold),
     alphnum = (:upper, :lower, :casefold),
+    hex = (:upper, :lower, :casefold),
+    charset = (:upper, :lower, :casefold),
     skip = (:casefold, :print),
+    checkdigit = (),
     _global = (:purlprefix,),
 )
 
@@ -90,7 +103,7 @@ const ALL_KNOWN_KEYS = Tuple(unique(collect(Iterators.flatten(values(KNOWN_KEYS)
 Return the number of bits needed to represent `n` distinct values (i.e. `ceil(log2(n))`
 computed via leading zeros).
 """
-cardbits(n::Integer) = 8 * sizeof(n) - leading_zeros(n)
+cardbits(n::Integer) = 8 * sizeof(n) - leading_zeros(max(n, 1) - 1)
 
 """
     cardtype(minbits::Int) -> DataType
@@ -131,8 +144,6 @@ The index is used as an error code in the generated `parsebytes` function,
 mapped back to the message string at `parse` time.
 """
 function defid_errmsg(state::DefIdState, msg::String)
-    idx = findfirst(==(msg), state.errconsts)
-    isnothing(idx) || return idx
     push!(state.errconsts, msg)
     length(state.errconsts)
 end
@@ -177,18 +188,18 @@ function push_value_segment!(exprs::IdExprs;
 end
 
 """
-    emit_print_detect!(exprs::IdExprs, nctx::NodeCtx, option, extracts, present_check)
+    emit_print_detect!(exprs::IdExprs, nctx::NodeCtx, option, extracts)
 
-Route extract expressions and optional presence detection to the right target.
+Route extract expressions to the right target.
 
 For optional fields (non-nothing `option`), appends to `nctx[:oprint_detect]`
 so the enclosing `defid_optional!` can emit them before the conditional print
 block. For required fields, appends directly to `exprs.print`.
 """
 function emit_print_detect!(exprs::IdExprs, nctx::NodeCtx,
-                            option, extracts::Vector{ExprVarLine}, present_check)
+                            option, extracts::Vector{ExprVarLine})
     if !isnothing(option)
-        push!(nctx[:oprint_detect], extracts..., :($option = $present_check))
+        append!(nctx[:oprint_detect], extracts)
     else
         append!(exprs.print, extracts)
     end
@@ -232,4 +243,13 @@ function defid_emit_extract(state::DefIdState, position::Int, width::Int,
                          nbits(fT) - width))
         :(Core.Intrinsics.and_int($ival, $fTmask))
     end
+end
+
+## Optional sentinel helpers
+
+unclaimed_sentinel(nctx::NodeCtx) =
+    (ref = get(nctx, :optional_sentinel, nothing)) !== nothing && ref[] === nothing
+
+function claim_sentinel!(nctx::NodeCtx, position::Int, nbits::Int)
+    nctx[:optional_sentinel][] = OptSentinel((position, nbits))
 end

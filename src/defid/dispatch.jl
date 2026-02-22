@@ -27,12 +27,12 @@ function defid_dispatch!(exprs::IdExprs,
         defid_literal!(exprs, state, nctx, lit)
     elseif node === :digits
         defid_digits!(exprs, state, nctx, args)
-    elseif node === :letters
-        defid_charseq!(exprs, state, nctx, args, :letters)
-    elseif node === :alphnum
-        defid_charseq!(exprs, state, nctx, args, :alphnum)
+    elseif node in (:letters, :alphnum, :hex, :charset)
+        defid_charseq!(exprs, state, nctx, args, node)
     elseif node === :embed
         defid_embed!(exprs, state, nctx, args)
+    elseif node === :checkdigit
+        defid_checkdigit!(exprs, state, nctx, args)
     else
         throw(ArgumentError("Unknown pattern node $node"))
     end
@@ -128,6 +128,9 @@ function defid_optional!(exprs::IdExprs,
                         parent.print_min, parent.print_max)
     push!(state.branches, child)
     nctx = NodeCtx(nctx, :current_branch, child)
+    sentinel_ref = Ref{Union{Nothing, OptSentinel}}(nothing)
+    nctx = NodeCtx(nctx, :optional_sentinel, sentinel_ref)
+    seg_start = length(exprs.segments)
     oexprs = (; parse = ExprVarLine[], print = ExprVarLine[], segments = exprs.segments, properties = exprs.properties)
     if all(a -> a isa String, args)
         defid_choice!(oexprs, state, nctx, push!(Any[join(Vector{String}(args))], ""))
@@ -136,10 +139,29 @@ function defid_optional!(exprs::IdExprs,
             defid_dispatch!(oexprs, state, nctx, arg)
         end
     end
+    seg_end = length(exprs.segments)
+    optvar = nctx[:optional]
+    if sentinel_ref[] === nothing
+        flag_nbits = (state.bits += 1)
+        push!(oexprs.parse, :(if $optvar
+            $(defid_emit_pack(state, Bool, optvar, flag_nbits))
+        end))
+        sentinel_ref[] = OptSentinel((flag_nbits, 1))
+    end
+    # Patch segment extract conditions with the resolved sentinel check
+    sentinel = sentinel_ref[]
+    check = :(!iszero($(defid_emit_extract(state, sentinel.position, sentinel.nbits))))
+    for i in seg_start+1:seg_end
+        extract = exprs.segments[i].extract
+        isempty(extract) && continue
+        last_expr = extract[end]
+        if Meta.isexpr(last_expr, :if) && last_expr.args[1] === true
+            last_expr.args[1] = check
+        end
+    end
     # Merge max back to parent; min stays unchanged (optional content doesn't raise the guarantee)
     parent.parsed_max = Base.max(parent.parsed_max, child.parsed_max)
     parent.print_max = Base.max(parent.print_max, child.print_max)
-    optvar = nctx[:optional]
     # Rewind pos when the optional has multiple nodes: an early node may advance
     # pos before a later node fails and sets option=false
     needs_rewind = length(args) > 1 && !all(a -> a isa String, args)
@@ -156,6 +178,8 @@ function defid_optional!(exprs::IdExprs,
     push!(exprs.parse, :($optvar = $guard))
     push!(exprs.parse, :(if $optvar; $(oexprs.parse...) end))
     needs_rewind && push!(exprs.parse, :($optvar || (pos = $savedpos)))
+    # Print-time presence detection: single assignment from the sentinel
     append!(exprs.print, nctx[:oprint_detect])
+    push!(exprs.print, :($(nctx[:optional]) = $check))
     push!(exprs.print, :(if $(nctx[:optional]); $(oexprs.print...) end))
 end

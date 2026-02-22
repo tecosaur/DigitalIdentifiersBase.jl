@@ -402,18 +402,18 @@ end
 
 function compute_digit_vocab(fieldvar::Symbol, option,
                              dspec::NamedTuple, state::DefIdState)
-    (; base, mindigits, maxdigits, min, max, pad, dI, dT) = dspec
+    (; base, mindigits, maxdigits, min, max, pad, dI, dT, claims_sentinel) = dspec
     fixedwidth = mindigits == maxdigits
     fnum = Symbol("$(fieldvar)_num")
     # numexpr: transform raw fnum into the stored representation
-    directval = cardbits(max - min + 1 + !isnothing(option)) ==
-                cardbits(max) && (min > 0 || isnothing(option))
+    directval = cardbits(max - min + 1 + claims_sentinel) ==
+                cardbits(max + 1) && (min > 0 || !claims_sentinel)
     numexpr = if directval
         if dI != dT; :($fnum % $dT) else fnum end
-    elseif iszero(min) && !isnothing(option)
+    elseif iszero(min) && claims_sentinel
         :($fnum + $(one(dT)))
-    elseif min - !isnothing(option) > 0
-        :(($fnum - $(dT(min - !isnothing(option)))) % $dT)
+    elseif min - claims_sentinel > 0
+        :(($fnum - $(dT(min - claims_sentinel))) % $dT)
     else
         if dI != dT; :($fnum % $dT) else fnum end
     end
