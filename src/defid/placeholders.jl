@@ -157,6 +157,12 @@ function fold_branches!(items::AbstractVector)
             item.args[1] = !item.args[1].args[2]
             push!(splices, (i, take_branch(item)))
             changed = true
+        elseif item.head === :|| && item.args[1] isa Bool
+            push!(splices, (i, if item.args[1] Any[] else Any[item.args[2]] end))
+            changed = true
+        elseif item.head === :&& && item.args[1] isa Bool
+            push!(splices, (i, if item.args[1] Any[item.args[2]] else Any[] end))
+            changed = true
         else
             changed |= fold_branches!(item.args)
         end

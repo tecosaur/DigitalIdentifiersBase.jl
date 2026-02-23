@@ -119,18 +119,22 @@ function defid_optional!(exprs::IdExprs,
                          state::DefIdState, nctx::NodeCtx,
                          args::Vector{Any})
     popt = get(nctx, :optional, nothing)
-    nctx = NodeCtx(nctx, :optional, gensym("optional"))
+    optvar = gensym("optional")
+    end_label = gensym("opt_end")
+    nctx = NodeCtx(nctx, :optional, optvar)
+    nctx = NodeCtx(nctx, :opt_label, end_label)
     nctx = NodeCtx(nctx, :oprint_detect, ExprVarLine[])
     # Fork a child branch for this optional scope
     parent = nctx[:current_branch]
-    child = ParseBranch(length(state.branches) + 1, parent, nctx[:optional],
-                        parent.parsed_min, parent.parsed_min, parent.parsed_max,
+    child = ParseBranch(length(state.branches) + 1, parent, optvar,
+                        parent.parsed_min, parent.parsed_min, parent.parsed_min,
                         parent.print_min, parent.print_max)
     push!(state.branches, child)
     nctx = NodeCtx(nctx, :current_branch, child)
     sentinel_ref = Ref{Union{Nothing, OptSentinel}}(nothing)
     nctx = NodeCtx(nctx, :optional_sentinel, sentinel_ref)
     seg_start = length(exprs.segments)
+    bits_before = state.bits
     oexprs = (; parse = ExprVarLine[], print = ExprVarLine[], segments = exprs.segments, properties = exprs.properties)
     if all(a -> a isa String, args)
         defid_choice!(oexprs, state, nctx, push!(Any[join(Vector{String}(args))], ""))
@@ -140,12 +144,9 @@ function defid_optional!(exprs::IdExprs,
         end
     end
     seg_end = length(exprs.segments)
-    optvar = nctx[:optional]
     if sentinel_ref[] === nothing
         flag_nbits = (state.bits += 1)
-        push!(oexprs.parse, :(if $optvar
-            $(defid_emit_pack(state, Bool, optvar, flag_nbits))
-        end))
+        push!(oexprs.parse, defid_emit_pack(state, Bool, optvar, flag_nbits))
         sentinel_ref[] = OptSentinel((flag_nbits, 1))
     end
     # Patch segment extract conditions with the resolved sentinel check
@@ -160,26 +161,37 @@ function defid_optional!(exprs::IdExprs,
         end
     end
     # Merge max back to parent; min stays unchanged (optional content doesn't raise the guarantee)
-    parent.parsed_max = Base.max(parent.parsed_max, child.parsed_max)
+    parent.parsed_max += child.parsed_max - child.start_min
     parent.print_max = Base.max(parent.print_max, child.print_max)
-    # Rewind pos when the optional has multiple nodes: an early node may advance
-    # pos before a later node fails and sets option=false
-    needs_rewind = length(args) > 1 && !all(a -> a isa String, args)
-    savedpos = if needs_rewind
-        gensym("savedpos")
-    end
-    needs_rewind && push!(exprs.parse, :($savedpos = pos))
+    # Build the branch guard (nested optionals require the parent flag too)
+    savedpos = gensym("savedpos")
     branch_check = Expr(:call, :__branch_check, Bool, child.id)
     guard = if isnothing(popt)
         branch_check
     else
         :($popt && $branch_check)
     end
+    push!(exprs.parse, :($savedpos = pos))
     push!(exprs.parse, :($optvar = $guard))
     push!(exprs.parse, :(if $optvar; $(oexprs.parse...) end))
-    needs_rewind && push!(exprs.parse, :($optvar || (pos = $savedpos)))
+    push!(exprs.parse, :(@label $end_label))
+    # Cleanup: rewind pos and clear any bits packed by partial success
+    opt_bits = state.bits - bits_before
+    if opt_bits > 1  # single segment: failure already leaves zero bits
+        opt_width = opt_bits
+        mask_type = cardtype(opt_width)
+        mask_val = typemax(mask_type) >> (8 * sizeof(mask_type) - opt_width)
+        clear_expr = :(parsed = Core.Intrinsics.and_int(parsed,
+            Core.Intrinsics.not_int(
+                Core.Intrinsics.shl_int(
+                    __cast_to_id($mask_type, $mask_val),
+                    8 * sizeof($(esc(state.name))) - $(state.bits)))))
+        push!(exprs.parse, :(if !$optvar; pos = $savedpos; $clear_expr end))
+    else
+        push!(exprs.parse, :(if !$optvar; pos = $savedpos end))
+    end
     # Print-time presence detection: single assignment from the sentinel
     append!(exprs.print, nctx[:oprint_detect])
-    push!(exprs.print, :($(nctx[:optional]) = $check))
-    push!(exprs.print, :(if $(nctx[:optional]); $(oexprs.print...) end))
+    push!(exprs.print, :($optvar = $check))
+    push!(exprs.print, :(if $optvar; $(oexprs.print...) end))
 end

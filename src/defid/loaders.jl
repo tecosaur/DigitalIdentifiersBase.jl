@@ -49,6 +49,14 @@ function register_chunks(nbytes::Int)
     chunks
 end
 
+# Returns (; iT, padding) when a backward-aligned register load reduces chunk
+# count for nbytes verification, nothing when already power-of-2 aligned.
+function backward_verify_chunk(nbytes::Int)
+    rT = register_type(min(nbytes, sizeof(UInt)))
+    sizeof(rT) <= nbytes && return nothing
+    (; iT = rT, padding = sizeof(rT) - nbytes)
+end
+
 ## Packing
 
 function pack_bytes(str::String, offset::Int, width::Int, iT::DataType)

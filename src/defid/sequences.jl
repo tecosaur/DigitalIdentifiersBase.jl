@@ -19,6 +19,9 @@ function defid_digits!(exprs::IdExprs,
     end
     pad = get(nctx, :pad, 0)::Int
     mindigits, maxdigits = parse_digit_range(args, max, base)
+    if min > 0
+        mindigits = Base.max(mindigits, ndigits(min; base))
+    end
     fixedwidth = mindigits == maxdigits
     if isnothing(max)
         max = (base^maxdigits) - 1
@@ -46,12 +49,7 @@ function defid_digits!(exprs::IdExprs,
     (; parsevar, directvar) = parsed
     append!(exprs.parse, parsed.exprs)
     posadv = ifelse(fixedwidth, maxdigits, bitsconsumed)
-    posexpr = if isnothing(option)
-        :(pos += $posadv)
-    else
-        :(if $option; pos += $posadv end)
-    end
-    push!(exprs.parse, defid_emit_pack(state, dT, parsevar, nbits), posexpr)
+    push!(exprs.parse, defid_emit_pack(state, dT, parsevar, nbits), :(pos += $posadv))
     # Extract and print
     fextract = :($fnum = $(defid_emit_extract(state, nbits, dbits)))
     fcast = if dI == dT; fnum else :($fnum % $dI) end
@@ -301,13 +299,14 @@ function defid_charseq_impl!(exprs::IdExprs,
     else
         "Expected $maxlen $kind characters"
     end)
+    opt_label = get(nctx, :opt_label, nothing)
     notfound = if isnothing(option)
         [:(return ($errmsg, pos))]
     else
-        [:($option = false), :($charvar = zero($cT)), :($lenvar = 0)]
+        [opt_fail_expr(option, opt_label)]
     end
     if !isnothing(option) && variable && minlen == 0
-        push!(exprs.parse, :($lenvar > 0 || ($option = false)))
+        push!(exprs.parse, :($lenvar > 0 || $(opt_fail_expr(option, opt_label))))
     else
         push!(exprs.parse,
               :(if $(if variable; :($lenvar < $minlen) else :($lenvar != $maxlen) end)
@@ -432,26 +431,23 @@ function defid_embed!(exprs::IdExprs,
     eresult = Symbol("$(fieldvar)_result")
     epos = Symbol("$(fieldvar)_epos")
     errmsg = defid_errmsg(state, "Invalid embedded $(T)")
+    opt_label = get(nctx, :opt_label, nothing)
     notfound = if isnothing(option)
         [:(return ($errmsg, pos))]
     else
-        [:($option = false)]
+        [opt_fail_expr(option, opt_label)]
     end
     eshifted = Symbol("$(fieldvar)_shifted")
     pack = defid_emit_pack(state, T, eshifted, nbits_pos - presbits)
     push!(exprs.parse,
           :(($eresult, $epos) = parsebytes($T, @view idbytes[pos:end])),
           :(if !($eresult isa $T); $(notfound...) end),
-          :($eshifted = $(to_lsb(eresult))))
-    if isnothing(option)
-        push!(exprs.parse, pack, :(pos += $epos - 1))
-    elseif claims
-        push!(exprs.parse,
-              :(if $option; $pack; $(defid_emit_pack(state, Bool, option, nbits_pos)); pos += $epos - 1 end))
-    else
-        push!(exprs.parse,
-              :(if $option; $pack; pos += $epos - 1 end))
+          :($eshifted = $(to_lsb(eresult))),
+          pack)
+    if claims
+        push!(exprs.parse, defid_emit_pack(state, Bool, true, nbits_pos))
     end
+    push!(exprs.parse, :(pos += $epos - 1))
     # Extract + print
     fextract = :($fieldvar = $(to_msb(defid_emit_extract(state, nbits_pos - presbits, ebits, T))))
     emit_print_detect!(exprs, nctx, option, ExprVarLine[fextract])

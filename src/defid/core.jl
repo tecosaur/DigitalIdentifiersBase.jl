@@ -310,6 +310,13 @@ function segments_formstring(segments::Vector{IdValueSegment}, branches::Vector{
     String(take!(io))
 end
 
+## Optional context helpers
+
+# Build the failure block for an optional scope: set flag=false, jump to cleanup label.
+function opt_fail_expr(flag::Symbol, label::Symbol)
+    Expr(:block, :($flag = false), :(@goto $label))
+end
+
 ## Optional sentinel helpers
 
 unclaimed_sentinel(nctx::NodeCtx) =

@@ -12,11 +12,12 @@ function defid_literal!(exprs::IdExprs,
                         state::DefIdState, nctx::NodeCtx,
                         lit::String)
     option = get(nctx, :optional, nothing)
+    opt_label = get(nctx, :opt_label, nothing)
     notfound = if isnothing(option)
         errsym = defid_errmsg(state, "Expected literal '$(lit)'")
         :(return ($errsym, pos))
     else
-        :($option = false)
+        opt_fail_expr(option, opt_label)
     end
     casefold = get(nctx, :casefold, state.casefold) === true
     if casefold
@@ -26,31 +27,13 @@ function defid_literal!(exprs::IdExprs,
     litlen = ncodeunits(litref)
     mismatch = gen_literal_mismatch(litref, casefold, state, nctx)
     lencheck = defid_lengthcheck(state, nctx, litlen)
-    if isnothing(option)
-        push!(exprs.parse,
-              :(if !$lencheck
-                    $notfound
-                elseif $mismatch
-                    $notfound
-                end),
-              :(pos += $litlen))
-    else
-        litvar = gensym("literal")
-        append!(exprs.parse,
-                (quote
-                     $litvar = true
-                     if !$lencheck
-                         $litvar = false
-                         $notfound
-                     elseif $mismatch
-                         $litvar = false
-                         $notfound
-                     end
-                     if $litvar
-                         pos += $litlen
-                     end
-                 end).args)
-    end
+    push!(exprs.parse,
+          :(if !$lencheck
+                $notfound
+            elseif $mismatch
+                $notfound
+            end),
+          :(pos += $litlen))
     push!(exprs.segments, IdValueSegment((0, :literal, :literal,
           sprint(show, lit), lit, nothing, :_, ExprVarLine[], Any[], option)))
     push!(exprs.print, :(print(io, $lit)), :(__segment_printed = $(length(exprs.segments))))
